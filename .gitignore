@@ -1,0 +1,45 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+.cache/
+
+# Local datasets, generated outputs, and experiment artifacts
+input/
+output/
+runs/
+logs/
+wandb/
+
+# Model weights and large binary artifacts
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.engine
+*.bin
+*.ply
+
+# Third-party checkpoints
+thirdparty/cinemagraphy/ckpts/
+
+# Nested Git repository accidentally added inside this project
+splat-main-new/LivingWorld/
+
+# Build artifacts
+.build/
+build/
+dist/
+*.egg-info/

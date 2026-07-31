@@ -3,12 +3,13 @@
 # pyre-unsafe
 
 import os
+from pathlib import Path
 from typing import Optional
 
 import pkg_resources
+import requests
 import torch
 import torch.nn as nn
-from huggingface_hub import hf_hub_download
 from iopath.common.file_io import g_pathmgr
 from sam3.model.decoder import (
     TransformerDecoder,
@@ -630,7 +631,7 @@ def build_sam3_image_model(
         eval_mode,
     )
     if load_from_HF and checkpoint_path is None:
-        checkpoint_path = download_ckpt_from_hf()
+        checkpoint_path = download_ckpt_from_modelscope()
     # Load checkpoint if provided
     if checkpoint_path is not None:
         _load_checkpoint(model, checkpoint_path)
@@ -641,13 +642,36 @@ def build_sam3_image_model(
     return model
 
 
-def download_ckpt_from_hf():
-    SAM3_MODEL_ID = "facebook/sam3"
-    SAM3_CKPT_NAME = "sam3.pt"
-    SAM3_CFG_NAME = "config.json"
-    _ = hf_hub_download(repo_id=SAM3_MODEL_ID, filename=SAM3_CFG_NAME)
-    checkpoint_path = hf_hub_download(repo_id=SAM3_MODEL_ID, filename=SAM3_CKPT_NAME)
-    return checkpoint_path
+def download_ckpt_from_modelscope():
+    """Return SAM3 weights, downloading them from ModelScope on first use."""
+    cache_root = Path(os.environ.get("HF_HOME", "/root/autodl-tmp/huggingface"))
+    cache_dir = Path(os.environ.get("SAM3_CACHE_DIR", cache_root / "sam3"))
+    checkpoint_path = cache_dir / "sam3.pt"
+    if checkpoint_path.is_file() and checkpoint_path.stat().st_size > 0:
+        return str(checkpoint_path)
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    partial_path = checkpoint_path.with_suffix(".pt.part")
+    start_byte = partial_path.stat().st_size if partial_path.exists() else 0
+    headers = {"Range": f"bytes={start_byte}-"} if start_byte else {}
+    url = "https://www.modelscope.cn/models/facebook/sam3/resolve/master/sam3.pt"
+
+    print(f"Downloading SAM3 checkpoint from ModelScope to {checkpoint_path}...")
+    with requests.get(url, headers=headers, stream=True, timeout=(20, 120)) as response:
+        response.raise_for_status()
+        append = start_byte > 0 and response.status_code == 206
+        written = start_byte if append else 0
+        with open(partial_path, "ab" if append else "wb") as output:
+            for chunk in response.iter_content(chunk_size=16 * 1024 * 1024):
+                if chunk:
+                    output.write(chunk)
+                    written += len(chunk)
+                    if written % (512 * 1024 * 1024) < len(chunk):
+                        print(f"Downloaded {written / 1024 / 1024:.0f} MiB")
+
+    os.replace(partial_path, checkpoint_path)
+    print(f"SAM3 checkpoint ready: {checkpoint_path}")
+    return str(checkpoint_path)
 
 
 def build_sam3_video_model(
@@ -772,7 +796,7 @@ def build_sam3_video_model(
 
     # Load checkpoint if provided
     if load_from_HF and checkpoint_path is None:
-        checkpoint_path = download_ckpt_from_hf()
+        checkpoint_path = download_ckpt_from_modelscope()
     if checkpoint_path is not None:
         with g_pathmgr.open(checkpoint_path, "rb") as f:
             ckpt = torch.load(f, map_location="cpu", weights_only=True)

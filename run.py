@@ -479,6 +479,8 @@ def run(config):
             config["stable_diffusion_checkpoint"],
             safety_checker=None,
             torch_dtype=torch.bfloat16,
+            variant="fp16",
+            use_safetensors=True,
         ).to(config["device"])
     inpainter_pipeline.scheduler = DDIMScheduler.from_config(inpainter_pipeline.scheduler.config)
     inpainter_pipeline.unet.set_attn_processor(AttnProcessor2_0())
@@ -500,7 +502,12 @@ def run(config):
         ).to(config["device"])
         depth_model.eval()
 
-    normal_estimator = MarigoldNormalsPipeline.from_pretrained("prs-eth/marigold-normals-v0-1", torch_dtype=torch.bfloat16).to(config["device"])
+    normal_estimator = MarigoldNormalsPipeline.from_pretrained(
+        "prs-eth/marigold-normals-v0-1",
+        torch_dtype=torch.bfloat16,
+        variant="fp16",
+        use_safetensors=True,
+    ).to(config["device"])
 
     kf_gen = KeyframeGen(config=config, inpainter_pipeline=inpainter_pipeline, mask_generator=mask_generator, depth_model=depth_model,
                             segment_model=segment_model, segment_processor=segment_processor, normal_estimator=normal_estimator,

@@ -38,11 +38,25 @@ class SyncDiffusion(nn.Module):
         else:
             raise ValueError(f'Stable-diffusion version {self.sd_version} not supported.')
 
-        # Load pretrained models from HuggingFace
-        self.vae = AutoencoderKL.from_pretrained(model_key, subfolder="vae").to(self.device)
+        # The project cache uses the upstream FP16 safetensors variants. Specify
+        # that variant explicitly so offline startup does not look for legacy
+        # FP32 ``diffusion_pytorch_model.bin`` weights. SyncDiffusion itself
+        # operates on FP32 image tensors, so cast the loaded parameters to FP32.
+        model_load_kwargs = {
+            "torch_dtype": torch.float32,
+            "variant": "fp16",
+            "use_safetensors": True,
+        }
+        self.vae = AutoencoderKL.from_pretrained(
+            model_key, subfolder="vae", **model_load_kwargs
+        ).to(self.device)
         self.tokenizer = CLIPTokenizer.from_pretrained(model_key, subfolder="tokenizer")
-        self.text_encoder = CLIPTextModel.from_pretrained(model_key, subfolder="text_encoder").to(self.device)
-        self.unet = UNet2DConditionModel.from_pretrained(model_key, subfolder="unet").to(self.device)
+        self.text_encoder = CLIPTextModel.from_pretrained(
+            model_key, subfolder="text_encoder", **model_load_kwargs
+        ).to(self.device)
+        self.unet = UNet2DConditionModel.from_pretrained(
+            model_key, subfolder="unet", **model_load_kwargs
+        ).to(self.device)
         
         # Freeze models
         for p in self.unet.parameters():

@@ -86,6 +86,14 @@ def make_final_hints_xy(hints, H, W, yflip=False, as_column_list=True, dtype=np.
 
         return sx.astype(float).tolist(), sy.astype(float).tolist(), ex.astype(float).tolist(), ey.astype(float).tolist()
 
+
+def has_motion_hints(hints):
+    """Return whether the UI supplied at least one start/end motion pair."""
+    if hints is None:
+        return False
+    hints = np.asarray(hints)
+    return hints.ndim == 2 and hints.shape[0] == 4 and hints.shape[1] > 0
+
 def save_image_incremental(img, base_dir, prefix="background"):
     out_dir = Path(base_dir) / "background"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -2082,8 +2090,9 @@ class KeyframeGen(FrameSyn):
             image_for_mask2 = np.asarray(pil_image_latest.convert("RGB"), dtype=np.uint8)
             save_image_incremental(image_for_mask2, args.input_dir, prefix="input_image")
 
-            if hints is None or len(hints) == 0:
+            if not has_motion_hints(hints):
                 mask = None
+                flow = None
             else:
                 mask, bbox, _ = sam3_segment_all_union_after(
                     image_for_mask,
@@ -2096,20 +2105,21 @@ class KeyframeGen(FrameSyn):
 
             internel_render_poses = get_pcdGenPoses('hemispherei')
 
-            if self.config['use_mom']:
-                train_data, none_idx = render_PCD(pil_image_latest, mask, hints_list, self.depth_latest, K, fov, render_poses, internel_render_poses)
-                viz_dir1 = os.path.join(args.input_dir, 'bo_Flow_viz')
-                os.makedirs(viz_dir1, exist_ok=True)
-                train_data = estimate_flow(train_data, viz_dir1, args)
+            if has_motion_hints(hints):
+                if self.config['use_mom']:
+                    train_data, none_idx = render_PCD(pil_image_latest, mask, hints_list, self.depth_latest, K, fov, render_poses, internel_render_poses)
+                    viz_dir1 = os.path.join(args.input_dir, 'bo_Flow_viz')
+                    os.makedirs(viz_dir1, exist_ok=True)
+                    train_data = estimate_flow(train_data, viz_dir1, args)
 
-                with torch.enable_grad():
-                    train_data, flow = optimize_motion(train_data, none_idx, 200, K, render_poses, internel_render_poses)
-                viz_dir = os.path.join(args.input_dir, 'ao_flow_viz')
-                os.makedirs(viz_dir, exist_ok=True)
-                viz_flow(train_data, viz_dir)
-                flow = flow.permute(1, 0)
-            else:
-                flow=estimate_flow_test(pil_image_latest, mask, final_hint_start_x, final_hint_start_y, final_hint_end_x, final_hint_end_y, args)
+                    with torch.enable_grad():
+                        train_data, flow = optimize_motion(train_data, none_idx, 200, K, render_poses, internel_render_poses)
+                    viz_dir = os.path.join(args.input_dir, 'ao_flow_viz')
+                    os.makedirs(viz_dir, exist_ok=True)
+                    viz_flow(train_data, viz_dir)
+                    flow = flow.permute(1, 0)
+                else:
+                    flow = estimate_flow_test(pil_image_latest, mask, final_hint_start_x, final_hint_start_y, final_hint_end_x, final_hint_end_y, args)
             first=True
             self.update_current_pc_by_kf(image=self.image_latest, depth=self.depth_latest, valid_mask=~self.sky_mask_latest, flow=flow, motion_mask=mask, hints=hints, first=first)
 

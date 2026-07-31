@@ -7,7 +7,7 @@ depth_conditioning: True
 
 # use gpt to generate scene description
 use_gpt: False
-debug: True
+debug: False
 
 # depth model and camera/depth parameters
 depth_model: moge

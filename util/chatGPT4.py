@@ -12,10 +12,17 @@ import httpx
 # run 'python -m spacy download en_core_web_sm' to load english language model
 nlp = spacy.load("en_core_web_sm")
 
-client = OpenAI(
-    # This is the default and can be omitted
-    api_key=os.environ['OPENAI_API_KEY'],
-)
+client = None
+
+
+def get_client():
+    global client
+    if client is None:
+        api_key = os.getenv('OPENAI_API_KEY')
+        if not api_key:
+            raise RuntimeError('OPENAI_API_KEY is required only when use_gpt=True.')
+        client = OpenAI(api_key=api_key)
+    return client
 
 class TextpromptGen(object):
     
@@ -69,7 +76,7 @@ class TextpromptGen(object):
 
         messages = [{"role": "system", "content": "You are an intelligent scene generator. Given a scene and there are 3 most significant common entities. please generate a brief background prompt about 50 words describing common things in the scene. You should not mention the entities in the background prompt. If needed, you can make reasonable guesses."}, \
                     {"role": "user", "content": content}]
-        response = client.chat.completions.create(
+        response = get_client().chat.completions.create(
             model=self.model,
             response_format={ "type": "json_object" },
             messages=messages,
@@ -119,7 +126,7 @@ class TextpromptGen(object):
             
         for i in range(10):
             try:
-                response = client.chat.completions.create(
+                response = get_client().chat.completions.create(
                     model=self.model,
                     response_format={ "type": "json_object" },
                     messages=messages,
@@ -243,7 +250,7 @@ class TextpromptGen(object):
             }]
             for _ in range(5):
                 try:
-                    resp = client.chat.completions.create(
+                    resp = get_client().chat.completions.create(
                         model="gpt-4o",
                         messages=msgs,
                         max_tokens=10,

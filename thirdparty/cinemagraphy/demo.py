@@ -1,8 +1,13 @@
 import argparse
 import os.path
 import json
+import sys
+
+# The upstream cinemagraphy modules use absolute ``lib.*`` imports.
+sys.path.insert(0, os.path.dirname(__file__))
 
 import imageio
+import torch.nn.functional as F
 import torch.utils.data.distributed
 import torchvision
 from torchvision.transforms import Compose, Normalize, ToTensor, InterpolationMode
@@ -194,6 +199,26 @@ def get_input_data(args, config, frame, ds_factor=1):
 
     h, w = src_img.shape[:2]
 
+    src_depth = frame['depth']
+    if not torch.is_tensor(src_depth):
+        src_depth = torch.as_tensor(src_depth)
+    src_depth = src_depth.detach().float().cpu()
+    if src_depth.ndim == 2:
+        src_depth = src_depth[None, None]
+    elif src_depth.ndim == 3:
+        src_depth = src_depth[None]
+    if src_depth.ndim != 4 or src_depth.shape[1] != 1:
+        raise ValueError(f"Expected depth with shape [1, 1, H, W], got {tuple(src_depth.shape)}")
+    if src_depth.shape[-2:] != (h, w):
+        src_depth = F.interpolate(src_depth, size=(h, w), mode='bilinear', align_corners=False)
+    # LivingWorld normalizes MoGe depth to a small scene-local range. The
+    # upstream cinemagraphy depth layering expects metric-like values > 1e-2.
+    valid_depth = src_depth[src_depth > 1e-6]
+    if valid_depth.numel() == 0:
+        raise ValueError('Motion estimation received an empty depth map')
+    src_depth = src_depth / valid_depth.median().clamp_min(1e-6)
+    src_depth = src_depth.clamp_min(1.001e-2)
+
     # dpt_model_path = 'ckpts/dpt_hybrid-midas-501f0c75.pt'
     # run_dpt(input_path=args.input_dir, output_path=dpt_out_dir, model_path=dpt_model_path, optimize=False)
     # disp_file = os.path.join(dpt_out_dir, 'image.png')
@@ -237,7 +262,7 @@ def get_input_data(args, config, frame, ds_factor=1):
     return {
         'motion_rgbs': motion_rgb[None, ...],
         'src_img': to_tensor(src_img).float()[None],
-        # 'src_depth': to_tensor(src_depth).float()[None],
+        'src_depth': src_depth,
         'hints': hints[0],
         'mask': mask[0],
         'intrinsic': torch.from_numpy(intrinsic).float()[None],
@@ -283,14 +308,14 @@ def eulerian_estimation(args, frame):
     scene_flow_estimator_weight = torch.load(os.path.join(args.cinema_ckpt, 'sceneflow_model.pth'),
                                              map_location=torch.device(device))
     scene_flow_estimator.load_state_dict(scene_flow_estimator_weight['netG'])
-    inpainter = Inpainter(device=device)
+    inpainter = Inpainter(device=device, ckpt_dir=args.cinema_ckpt)
     renderer = ImgRenderer(args, config, model, scene_flow_estimator, inpainter, device)
 
     """ render """
     model.switch_to_eval()
     with torch.no_grad():
         renderer.process_data(data)
-        flow=renderer.compute_flow_and_inpaint()
+        _, flow, *_ = renderer.compute_flow_and_inpaint()
     return flow
 
     '''
