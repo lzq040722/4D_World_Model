@@ -547,15 +547,16 @@ def render_interaction_mlp(
             t = int(t)
             if t < 0 or t > T:
                 raise ValueError(f"render_interaction_mlp timestep {t} outside [0, {T}]")
+
+            means3D_f = means3D.clone()
+            means3D_b = means3D.clone()
+            moving_idx = motion_mask.nonzero(as_tuple=False).squeeze(1)
+            means3D_f[moving_idx] = f_pos[t]
             b_idx = T - t
             alpha = t / T
             w_f = 1 - alpha
             w_b = alpha
 
-            means3D_f = means3D.clone()
-            means3D_b = means3D.clone()
-            moving_idx = motion_mask.nonzero(as_tuple=False).squeeze()
-            means3D_f[moving_idx] = f_pos[t]
             means3D_b[moving_idx] = b_pos[b_idx]
 
             opacity_base = opacity

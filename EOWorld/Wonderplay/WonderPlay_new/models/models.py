@@ -854,7 +854,9 @@ class FrameSyn(torch.nn.Module):
         point_depth = rearrange(depth, "b c h w -> (w h b) c")
         new_points_3d = kf_camera.unproject(self.points, point_depth)
 
-        flow_for_points = flow.detach().to(self.device).squeeze(0).permute(2, 1, 0)
+        flow_for_points = flow.detach().clone().to(self.device)
+        flow_for_points[:, 0] *= -1
+        flow_for_points = flow_for_points.squeeze(0).permute(2, 1, 0)
         flow_points = (
             torch.stack(
                 torch.meshgrid(
@@ -1720,7 +1722,8 @@ class FrameSyn(torch.nn.Module):
         new_normals = rearrange(normals, "b c h w -> (w h b) c")
         new_points_3d = kf_camera.unproject(self.points, point_depth)
         if flow is not None:
-            flow_for_points = flow.detach().to(self.device)
+            flow_for_points = flow.detach().clone().to(self.device)
+            flow_for_points[:, 0] *= -1
             flow_for_points = flow_for_points.squeeze(0).permute(2, 1, 0)
             flow_points = (
                 torch.stack(

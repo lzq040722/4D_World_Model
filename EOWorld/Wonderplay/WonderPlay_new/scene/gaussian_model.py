@@ -72,14 +72,15 @@ class GaussianModel:
         """
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree
-        self._xyz = torch.empty(0).cuda()
-        self._features_dc = torch.empty(0).cuda()
-        self._scaling = torch.empty(0).cuda()
-        self._rotation = torch.empty(0).cuda()
-        self._opacity = torch.empty(0).cuda()
-        self.max_radii2D = torch.empty(0).cuda()
-        self.xyz_gradient_accum = torch.empty(0).cuda()
-        self.denom = torch.empty(0).cuda()
+        self._xyz = torch.empty((0, 3), device="cuda")
+        self._features_dc = torch.empty((0, 1, 3), device="cuda")
+        self._scaling = torch.empty((0, 3), device="cuda")
+        self._rotation = torch.empty((0, 4), device="cuda")
+        self._opacity = torch.empty((0, 1), device="cuda")
+        self.filter_3D = torch.empty((0, 1), device="cuda")
+        self.max_radii2D = torch.empty(0, device="cuda")
+        self.xyz_gradient_accum = torch.empty(0, device="cuda")
+        self.denom = torch.empty(0, device="cuda")
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
@@ -186,12 +187,12 @@ class GaussianModel:
             self.is_sky_filter = previous_gaussian.is_sky_filter
             self.delete_mask_all = previous_gaussian.delete_mask_all
         else:
-            self._xyz_prev = torch.empty(0).cuda()
-            self._features_dc_prev = torch.empty(0).cuda()
-            self._scaling_prev = torch.empty(0).cuda()
-            self._rotation_prev = torch.empty(0).cuda()
-            self._opacity_prev = torch.empty(0).cuda()
-            self.filter_3D_prev = torch.empty(0).cuda()
+            self._xyz_prev = torch.empty((0, 3), device="cuda")
+            self._features_dc_prev = torch.empty((0, 1, 3), device="cuda")
+            self._scaling_prev = torch.empty((0, 3), device="cuda")
+            self._rotation_prev = torch.empty((0, 4), device="cuda")
+            self._opacity_prev = torch.empty((0, 1), device="cuda")
+            self.filter_3D_prev = torch.empty((0, 1), device="cuda")
             self._scene_flow_prev = torch.empty((0, 3), device="cuda")
             self._motion_mask_prev = torch.empty((0, 1), dtype=torch.bool, device="cuda")
             self.visibility_filter_all = torch.empty(0, dtype=torch.bool).cuda()
@@ -1279,7 +1280,13 @@ class GaussianModel:
         scale = self.get_scaling_all.detach().cpu().numpy()
         rotation = self.get_rotation_all.detach().cpu().numpy()
 
-        filter_3D = torch.cat([self.filter_3D.detach(), self.filter_3D_prev.detach()], dim=0).cpu().numpy()
+        filter_3D = torch.cat(
+            [
+                getattr(self, "filter_3D", torch.empty((0, 1), device="cuda")).detach(),
+                getattr(self, "filter_3D_prev", torch.empty((0, 1), device="cuda")).detach(),
+            ],
+            dim=0,
+        ).cpu().numpy()
 
         def _align_rows(arr, target_rows, fill_value=0):
             if arr.shape[0] == target_rows:

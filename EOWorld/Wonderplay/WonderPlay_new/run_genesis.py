@@ -273,6 +273,34 @@ def estimate_flow(frame_pil, depth, mask, final_hint_start_x, final_hint_start_y
         f"mean={magnitude.mean().item():.6f}",
         f"max={magnitude.max().item():.6f}",
     )
+
+    active_mask = magnitude > 1e-4
+
+    u = flow[:, 0]
+    v = flow[:, 1]
+
+    print(
+        "[estimate_flow-debug] signed flow:",
+        f"u_mean={u[active_mask].mean().item():.6f}",
+        f"v_mean={v[active_mask].mean().item():.6f}",
+    )
+
+    sx = int(final_hint_start_x[0][0])
+    sy = int(final_hint_start_y[0][0])
+    ex = float(final_hint_end_x[0][0])
+    ey = float(final_hint_end_y[0][0])
+
+    hint_u = (ex - sx) / 50.0
+    hint_v = (ey - sy) / 50.0
+
+    pred_u = flow[0, 0, sy, sx].item()
+    pred_v = flow[0, 1, sy, sx].item()
+
+    print(
+        "[estimate_flow-debug] hint consistency:",
+        f"hint_uv=({hint_u:.6f}, {hint_v:.6f})",
+        f"pred_uv_at_hint=({pred_u:.6f}, {pred_v:.6f})",
+    )
     return flow
 
 
@@ -633,16 +661,23 @@ def train_interaction_motion_model(config):
                 env_motion_mask = env_motion_mask[:, 0]
             env_motion_mask = env_motion_mask.bool()
 
-            if direction == "obj2env":
-                if env_motion_mask.sum().item() == 0:
-                    raise RuntimeError("obj2env has no moving final environment Gaussians")
-                xyz = env_xyz[env_motion_mask].detach()
-                scene_flow = env_scene_flow[env_motion_mask]
-                source = "gaussians_env_motion_mask"
-            else:
-                xyz = env_xyz.detach()
-                scene_flow = env_scene_flow
-                source = "gaussians_env"
+            # if direction == "obj2env":
+            #     if env_motion_mask.sum().item() == 0:
+            #         raise RuntimeError("obj2env has no moving final environment Gaussians")
+            #     xyz = env_xyz[env_motion_mask].detach()
+            #     scene_flow = env_scene_flow[env_motion_mask]
+            #     source = "gaussians_env_motion_mask"
+            # else:
+            #     xyz = env_xyz.detach()
+            #     scene_flow = env_scene_flow
+            #     source = "gaussians_env"
+
+            if direction == "obj2env" and env_motion_mask.sum().item() == 0:
+                raise RuntimeError("obj2env has no moving final environment Gaussians")
+
+            xyz = env_xyz.detach()
+            scene_flow = env_scene_flow
+            source = "gaussians_env"
         except Exception as exc:
             print(
                 "[interaction] WARNING: failed to train HashGrid from Gaussian "
@@ -787,6 +822,15 @@ def generate_object_motion_hints(simulation_states, viewpoint_camera):
         raise RuntimeError("Genesis object displacement is too small to form a motion hint")
     print(f"[interaction] Generated obj2env motion hint: {hint}")
     return [hint]
+    # hints = [
+    #     [311, 361, 254, 403],
+    #     [369, 382, 285, 451],
+    #     [431, 401, 355, 472],
+    # ]
+
+    # print(f"[interaction-debug] Using 3 baseline hints: {hints}")
+
+    # return hints
 
 
 def collect_interaction_states(
@@ -859,7 +903,56 @@ def precompute_interaction_environment_positions(
     environment_points = env_xyz[environment_mask]
     if environment_points.shape[0] == 0:
         raise RuntimeError("Interaction scene contains no moving environment Gaussians")
+    # ============================================================
+    # ADD DEBUG HERE
+    # ============================================================
+    with torch.no_grad():
+        scene_flow_all = gaussians.get_scene_flow_all.detach()
 
+        env_count = env_xyz.shape[0]
+        if scene_flow_all.shape[0] >= env_count:
+            env_scene_flow = scene_flow_all[-env_count:]
+        else:
+            raise RuntimeError(
+                f"scene_flow count mismatch: "
+                f"{scene_flow_all.shape[0]} vs env_count={env_count}"
+            )
+
+        transferred_flow = env_scene_flow[environment_mask]
+
+        uv_before = proj_uv(environment_points, viewpoint_camera)
+
+        uv_after_transfer = proj_uv(
+            environment_points + transferred_flow,
+            viewpoint_camera,
+        )
+
+        transferred_duv = uv_after_transfer - uv_before
+        valid_transfer = torch.isfinite(transferred_duv).all(dim=1)
+
+        print(
+            "[interaction-debug] transferred flow screen direction:",
+            f"du_mean={transferred_duv[valid_transfer, 0].mean().item():.6f}",
+            f"dv_mean={transferred_duv[valid_transfer, 1].mean().item():.6f}",
+        )
+
+        predicted_flow = motion_model(environment_points)
+
+        uv_after_hashgrid = proj_uv(
+            environment_points + predicted_flow,
+            viewpoint_camera,
+        )
+
+        predicted_duv = uv_after_hashgrid - uv_before
+        valid_pred = torch.isfinite(predicted_duv).all(dim=1)
+
+        print(
+            "[interaction-debug] HashGrid flow screen direction:",
+            f"du_mean={predicted_duv[valid_pred, 0].mean().item():.6f}",
+            f"dv_mean={predicted_duv[valid_pred, 1].mean().item():.6f}",
+        )
+
+        
     train_source = getattr(motion_model, "_interaction_train_source", None)
     train_count = getattr(motion_model, "_interaction_train_xyz_count", None)
     if train_source == "gaussians_env_motion_mask" and train_count != environment_points.shape[0]:
@@ -1745,7 +1838,10 @@ def run(config, dt_string=None):
 
     gaussians = GaussianModel(sh_degree=0, previous_gaussian=gaussians)
     i = 0
-    config["boundary_rules"] = {"y_min": traindata_layer["ground_value"]}
+    # Boundary rules are only used by the physics simulator. Environment-only
+    # motion exits below before simulator construction.
+    if motion_type != "environment":
+        config["boundary_rules"] = {"y_min": traindata_layer["ground_value"]}
 
     total_object_pts_num = 0
     object_pts_num_list = []
@@ -2524,6 +2620,10 @@ if __name__ == "__main__":
         config["num_scenes"] = 1
     if "rotation_path" not in config:
         config["rotation_path"] = [0]  # single scene
+    # Keep this key in the structured config so physics branches can update it
+    # with the automatically estimated ground height.
+    if "boundary_rules" not in config:
+        config["boundary_rules"] = {}
     if "force_function" not in config and "force_function_name" in config:
         config["force_function"] = f"simulator.genesis_functions.{config['force_function_name']}"
     if "use_gpt" not in config:
