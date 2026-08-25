@@ -12,6 +12,11 @@ source /root/miniconda3/etc/profile.d/conda.sh
 conda activate /root/autodl-tmp/myenv/wp   
 
 #stage 1
-python WonderPlay_new/run_genesis.py --config examples/configs/Golden_Gate_Bridge.yaml --prefix obj2env
+python WonderPlay_new/run_genesis.py --config examples/configs/Golden_Gate_Bridge_I.yaml --prefix obj2env1
+
+python WonderPlay_new/run_multiview_interaction.py \
+  --config examples/configs/venice_I.yaml \
+  --port 7778
+
 #stage 2
 python WonderPlay_new/run_video_model.py --input_folder 3d_result/wonderplay/venice/smooth_0.5/simulation --output_folder 3d_result/wonderplay/venice/smooth_0.5/output_video --sdedit_strengths 0.85

@@ -63,6 +63,10 @@ def gs_to_pt3d(xyz, no_z_offset=False):
 
 
 class Simulator(nn.Module):
+    # Scene.add_entity is guarded by Genesis' assert_unbuilt decorator. This
+    # scene is built in __init__, so fixed particles cannot be appended later.
+    supports_runtime_environment_append = False
+
     def __init__(
         self,
         config,

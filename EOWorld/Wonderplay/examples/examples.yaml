@@ -1,0 +1,6 @@
+- name: venice
+  image_filepath: examples/imgs/venice/image.png
+  style_prompt: DSLR 35mm landscape
+  content_prompt: The Grand Canal in Venice, boats, historical buildings, waterway 
+  negative_prompt: ""
+  background: ""

@@ -650,6 +650,20 @@ class GaussianModel:
             self.active_sh_degree += 1
 
     def create_from_gaussians(self, pcd, spatial_lr_scale, gaussians):
+        old_current_count = self._xyz.shape[0]
+        old_total_count = old_current_count + self._xyz_prev.shape[0]
+        metadata = {
+            "visibility_filter_all": self.visibility_filter_all,
+            "is_sky_filter": self.is_sky_filter,
+            "delete_mask_all": self.delete_mask_all,
+        }
+        for name, values in metadata.items():
+            if values.shape[0] != old_total_count:
+                raise RuntimeError(
+                    f"{name} length {values.shape[0]} does not match Gaussian "
+                    f"count {old_total_count} before object append"
+                )
+
         input_xyz = gaussians._xyz
         input_features_dc = gaussians._features_dc
         input_scaling = gaussians._scaling
@@ -711,24 +725,125 @@ class GaussianModel:
                 torch.cat((self._opacity, input_opacity), dim=0).requires_grad_(True)
             )
 
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        visibility_filter_current = torch.ones(
-            (input_xyz.shape[0]), device="cuda"
-        ).bool()
-        visibility_filter_prev = self.visibility_filter_all
-        self.visibility_filter_all = torch.cat(
-            (visibility_filter_current, visibility_filter_prev), dim=0
+        self.max_radii2D = torch.zeros(
+            self.get_xyz.shape[0], device=input_xyz.device
         )
 
-        is_sky_filter_prev = self.is_sky_filter
-        is_sky_filter_current = torch.zeros(
-            (self.get_xyz.shape[0]), dtype=torch.bool, device="cuda"
+        def insert_object_metadata(existing, new_values):
+            return torch.cat(
+                (
+                    existing[:old_current_count],
+                    new_values,
+                    existing[old_current_count:],
+                ),
+                dim=0,
+            )
+
+        point_count = input_xyz.shape[0]
+        self.visibility_filter_all = insert_object_metadata(
+            metadata["visibility_filter_all"],
+            torch.ones(point_count, dtype=torch.bool, device=input_xyz.device),
         )
-        self.is_sky_filter = torch.cat(
-            (is_sky_filter_current, is_sky_filter_prev), dim=0
+        self.is_sky_filter = insert_object_metadata(
+            metadata["is_sky_filter"],
+            torch.zeros(point_count, dtype=torch.bool, device=input_xyz.device),
         )
+        self.delete_mask_all = insert_object_metadata(
+            metadata["delete_mask_all"],
+            torch.zeros(point_count, dtype=torch.bool, device=input_xyz.device),
+        )
+
+        total_count = self.get_xyz_all.shape[0]
+        for name in metadata:
+            values = getattr(self, name)
+            if values.shape[0] != total_count:
+                raise RuntimeError(
+                    f"{name} length {values.shape[0]} does not match Gaussian "
+                    f"count {total_count} after object append"
+                )
 
         del gaussians
+
+    @torch.no_grad()
+    def append_environment_from_gaussian(self, source):
+        """Append ``source`` current points to the frozen environment segment.
+
+        The renderer uses ``_xyz`` for the object/trainable segment and
+        ``_xyz_prev`` for the frozen environment segment.  A normal
+        ``previous_gaussian`` construction cannot express an environment-only
+        update because it always places newly created points in ``_xyz``.
+        """
+        point_count = source._xyz.shape[0]
+        if point_count == 0:
+            return
+
+        self._xyz_prev = torch.cat([self._xyz_prev, source._xyz.detach()], dim=0)
+        self._features_dc_prev = torch.cat(
+            [self._features_dc_prev, source._features_dc.detach()], dim=0
+        )
+        self._scaling_prev = torch.cat(
+            [self._scaling_prev, source._scaling.detach()], dim=0
+        )
+        self._rotation_prev = torch.cat(
+            [self._rotation_prev, source._rotation.detach()], dim=0
+        )
+        self._opacity_prev = torch.cat(
+            [self._opacity_prev, source._opacity.detach()], dim=0
+        )
+        self.filter_3D_prev = torch.cat(
+            [self.filter_3D_prev, source.filter_3D.detach()], dim=0
+        )
+
+        source_scene_flow = getattr(
+            source, "_scene_flow", torch.zeros_like(source._xyz)
+        )
+        source_motion_mask = getattr(
+            source,
+            "_motion_mask",
+            torch.zeros(
+                point_count,
+                1,
+                dtype=torch.bool,
+                device=source._xyz.device,
+            ),
+        )
+        if source_motion_mask.ndim == 1:
+            source_motion_mask = source_motion_mask[:, None]
+        source_motion_mask = source_motion_mask[:, :1].bool()
+        self._scene_flow_prev = torch.cat(
+            [self._scene_flow_prev, source_scene_flow.detach()], dim=0
+        )
+        self._motion_mask_prev = torch.cat(
+            [self._motion_mask_prev, source_motion_mask.detach()], dim=0
+        )
+
+        self.visibility_filter_all = torch.cat(
+            [
+                self.visibility_filter_all,
+                torch.ones(point_count, dtype=torch.bool, device=self._xyz.device),
+            ],
+            dim=0,
+        )
+        self.is_sky_filter = torch.cat(
+            [
+                self.is_sky_filter,
+                torch.zeros(point_count, dtype=torch.bool, device=self._xyz.device),
+            ],
+            dim=0,
+        )
+        self.delete_mask_all = torch.cat(
+            [
+                self.delete_mask_all,
+                torch.zeros(point_count, dtype=torch.bool, device=self._xyz.device),
+            ],
+            dim=0,
+        )
+
+        # These cached concatenations are maintained by the existing motion
+        # transfer code. They must be rebuilt after the environment grows.
+        for cache_name in ("_scene_flow_all", "_motion_mask_all"):
+            if hasattr(self, cache_name):
+                delattr(self, cache_name)
 
     def create_from_pcd(
         self,
@@ -868,6 +983,26 @@ class GaussianModel:
         self.delete_mask_all = torch.cat(
             (delete_mask_current, delete_mask_prev), dim=0
         )
+
+    @torch.no_grad()
+    def delete_points(self, tdgs_cam):
+        """Hide non-sky points visible from ``tdgs_cam``."""
+        xyz = self.get_xyz_all
+        rotation = torch.as_tensor(tdgs_cam.R, device=xyz.device, dtype=xyz.dtype)
+        translation = torch.as_tensor(tdgs_cam.T, device=xyz.device, dtype=xyz.dtype)
+        xyz_camera = xyz @ rotation + translation[None, :]
+        z = xyz_camera[:, 2]
+        safe_z = z.clamp_min(0.001)
+        x = xyz_camera[:, 0] / safe_z * tdgs_cam.focal_x + tdgs_cam.image_width / 2.0
+        y = xyz_camera[:, 1] / safe_z * tdgs_cam.focal_y + tdgs_cam.image_height / 2.0
+        in_screen = (
+            (z > 0)
+            & (x >= 0)
+            & (x < tdgs_cam.image_width)
+            & (y >= 0)
+            & (y < tdgs_cam.image_height)
+        )
+        self.delete_mask_all |= in_screen & ~self.is_sky_filter
 
     @torch.no_grad()
     def set_inscreen_points_to_visible(self, tdgs_cam):

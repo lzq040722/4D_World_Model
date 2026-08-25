@@ -68,6 +68,7 @@ from util.utils import (
     soft_stitching,
     crop_to_square,
     convert_pt3d_cam_to_3dgs_cam,
+    load_example_yaml,
 )
 from util.image_edit_inpaint import ImageEditInpaintPipeline
 from util.segment_utils import create_mask_generator_repvit
@@ -111,6 +112,9 @@ view_matrix_wonder = [-1, 0, 0, 0, 0, -1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
 background = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32, device="cuda")
 iter_number = None
 kf_gen = None
+annotation_image = None
+annotation_depth = None
+annotation_valid_mask = None
 gaussians = None
 opt = None
 scene_dict = None
@@ -119,6 +123,7 @@ pt_gen = None
 
 sim = None
 movement = None
+current_object_xyz = None
 already_object_pts_num = 0
 
 
@@ -320,7 +325,15 @@ def seeding(seed):
 
 # ========== Environment Motion Rendering Function ==========
 
-def prepare_environment_motion_fields(save_dir, config, fixed_hints_override=None):
+def prepare_environment_motion_fields(
+    save_dir,
+    config,
+    fixed_hints_override=None,
+    mask_review_callback=None,
+    image_override=None,
+    depth_override=None,
+    valid_mask_override=None,
+):
     """Estimate 2D motion fields and bind them to current_pc_latest before 3DGS training."""
     env_config = config.get('environment_motion', {})
     sam_prompt = env_config.get('sam_prompt', 'water')
@@ -340,8 +353,11 @@ def prepare_environment_motion_fields(save_dir, config, fixed_hints_override=Non
     sam3_model = build_sam3_image_model()
     sam3_processor = Sam3Processor(sam3_model)
 
-    image_tensor = kf_gen.image_latest
+    # Motion annotations and SAM3 must use the exact input frame shown to the
+    # user.  Gaussian re-composition is deliberately excluded here.
+    image_tensor = image_override if image_override is not None else kf_gen.image_latest
     image_pil = ToPILImage()(image_tensor[0].detach().cpu().clamp(0, 1))
+    image_pil.save(save_dir / "motion_input.png")
 
     state = sam3_processor.set_image(image_pil)
     prompts = [p.strip() for p in str(sam_prompt).split(",") if p.strip()]
@@ -387,7 +403,10 @@ def prepare_environment_motion_fields(save_dir, config, fixed_hints_override=Non
         overlay[overlay_mask].astype(np.float32) * 0.35
         + np.array([255, 40, 40], dtype=np.float32) * 0.65
     ).astype(np.uint8)
-    Image.fromarray(overlay).save(save_dir / "sam3_mask_overlay.png")
+    overlay_image = Image.fromarray(overlay)
+    overlay_image.save(save_dir / "sam3_mask_overlay.png")
+    if mask_review_callback is not None:
+        mask_review_callback(overlay_image)
 
     print(f"[environment_motion_prepare] Step 2: Cinemagraphy 2D flow estimation with {len(fixed_hints)} hints")
     hints_array = np.array(fixed_hints)
@@ -419,9 +438,15 @@ def prepare_environment_motion_fields(save_dir, config, fixed_hints_override=Non
     args.split = "demo"
     args.scene_id = scene_name or config.get("example_name", "scene")
 
+    motion_depth = depth_override if depth_override is not None else kf_gen.depth_latest
+    point_valid_mask = (
+        valid_mask_override
+        if valid_mask_override is not None
+        else ~kf_gen.sky_mask_latest.bool()
+    )
     flow_2d = estimate_flow(
         image_pil,
-        kf_gen.depth_latest,
+        motion_depth,
         motion_mask_2d,
         final_hint_start_x,
         final_hint_start_y,
@@ -433,8 +458,8 @@ def prepare_environment_motion_fields(save_dir, config, fixed_hints_override=Non
     scene_flow, point_motion_mask = kf_gen.attach_flow_to_current_pc_latest(
         flow=flow_2d,
         motion_mask=motion_mask_2d,
-        valid_mask=~kf_gen.sky_mask_latest,
-        depth=kf_gen.depth_latest,
+        valid_mask=point_valid_mask,
+        depth=motion_depth,
     )
     motion_count = point_motion_mask.sum().item()
     point_count = point_motion_mask.shape[0]
@@ -547,7 +572,28 @@ def sync_current_pc_scene_flow_to_final_environment_gaussians(
     target_idx = env_motion_mask.nonzero(as_tuple=False).squeeze(1)
     target_xyz = env_xyz[target_idx]
 
-    env_scene_flow = torch.zeros_like(env_xyz)
+    previous_env_scene_flow = getattr(
+        gaussians, "_scene_flow_prev", torch.zeros_like(env_xyz)
+    )
+    if previous_env_scene_flow.shape != env_xyz.shape:
+        previous_env_scene_flow = torch.zeros_like(env_xyz)
+    previous_env_motion_mask = getattr(
+        gaussians,
+        "_motion_mask_prev",
+        torch.zeros(
+            env_xyz.shape[0], 1, dtype=torch.bool, device=env_xyz.device
+        ),
+    )
+    if previous_env_motion_mask.shape[0] != env_xyz.shape[0]:
+        previous_env_motion_mask = torch.zeros(
+            env_xyz.shape[0], 1, dtype=torch.bool, device=env_xyz.device
+        )
+    if previous_env_motion_mask.ndim > 1:
+        previous_env_motion_mask = previous_env_motion_mask[:, 0]
+
+    # Preserve supervision attached from older viewpoints. Points selected in
+    # the current view are updated with the current nearest-neighbour flow.
+    env_scene_flow = previous_env_scene_flow.detach().clone()
     chunk_size = 256
     for start in range(0, target_xyz.shape[0], chunk_size):
         end = min(start + chunk_size, target_xyz.shape[0])
@@ -582,8 +628,11 @@ def sync_current_pc_scene_flow_to_final_environment_gaussians(
 
     gaussians._scene_flow = base_scene_flow.detach()
     gaussians._motion_mask = base_motion_mask.detach().bool()
+    accumulated_env_motion_mask = previous_env_motion_mask | env_motion_mask
     gaussians._scene_flow_prev = env_scene_flow.detach()
-    gaussians._motion_mask_prev = env_motion_mask[:, None].detach().bool()
+    gaussians._motion_mask_prev = (
+        accumulated_env_motion_mask[:, None].detach().bool()
+    )
     gaussians._scene_flow_all = torch.cat(
         [gaussians._scene_flow, gaussians._scene_flow_prev], dim=0
     )
@@ -594,7 +643,9 @@ def sync_current_pc_scene_flow_to_final_environment_gaussians(
     moving_flow = env_scene_flow[env_motion_mask]
     print(
         "[interaction] Transferred current_pc scene flow to final environment "
-        f"Gaussians: {int(env_motion_mask.sum().item())}/{env_motion_mask.numel()} "
+        f"Gaussians: current={int(env_motion_mask.sum().item())}, "
+        f"accumulated={int(accumulated_env_motion_mask.sum().item())}/"
+        f"{env_motion_mask.numel()} "
         f"points, source={int(source_valid.sum().item())}, xyz_scale={scale:g}"
     )
     print(
@@ -602,7 +653,7 @@ def sync_current_pc_scene_flow_to_final_environment_gaussians(
         f"abs_mean={moving_flow.abs().mean(dim=0).detach().cpu().numpy()}",
         f"max={moving_flow.abs().max(dim=0).values.detach().cpu().numpy()}",
     )
-    return env_xyz, env_motion_mask, env_scene_flow
+    return env_xyz, accumulated_env_motion_mask, env_scene_flow
 
 
 def validate_interaction_config(config):
@@ -624,7 +675,7 @@ def validate_interaction_config(config):
     return direction, velocity_scale
 
 
-def train_interaction_motion_model(config):
+def train_interaction_motion_model(config, motion_model=None):
     """Train on the inpainted environment points in Gaussian world units."""
     direction = str(config.get("interaction", {}).get("direction", "")).lower()
     scale = float(config.get("interaction", {}).get("xyz_scale", xyz_scale))
@@ -703,33 +754,80 @@ def train_interaction_motion_model(config):
         f"flow_abs_mean={scene_flow.detach().abs().mean().item():.6f}"
     )
     motion_pc = _InteractionMotionPointCloud(xyz, scene_flow)
-    motion_model = HashEncoderMotionModel().to(config["device"])
-    motion_model = train_hashgrid(motion_pc, motion_model, iterations=100)
+    reusing_model = motion_model is not None
+    if motion_model is None:
+        motion_model = HashEncoderMotionModel().to(config["device"])
+    motion_model = train_hashgrid(
+        motion_pc,
+        motion_model,
+        iterations=100,
+        freeze_mlp=reusing_model,
+    )
     motion_model._interaction_train_source = source
     motion_model._interaction_train_xyz_count = int(xyz.shape[0])
     motion_model._interaction_train_xyz_mean = xyz.detach().mean(dim=0)
     return motion_model
 
 
-def get_interaction_query_points(save_dir, config=None):
+def get_interaction_query_points(save_dir, config=None, viewpoint_camera=None):
     """Select inpainted environment points under the single object silhouette."""
-    object_mask_path = kf_gen.run_dir / "segmentation" / "object_00.png"
-    if not object_mask_path.exists():
-        raise FileNotFoundError(f"Object mask not found: {object_mask_path}")
+    object_mask = None
+    if viewpoint_camera is not None and current_object_xyz is not None:
+        object_count = gaussians._xyz.shape[0]
+        render_mask = torch.zeros(
+            gaussians.get_xyz_all.shape[0],
+            dtype=torch.bool,
+            device=gaussians.get_xyz_all.device,
+        )
+        render_mask[:object_count] = True
+        with torch.no_grad():
+            object_render = render(
+                viewpoint_camera,
+                gaussians,
+                opt,
+                background,
+                timestep=0,
+                movement_sim=[current_object_xyz],
+                render_mask=render_mask,
+            )
+        object_opacity = object_render["final_opacity"].detach().squeeze()
+        if object_opacity.ndim != 2:
+            raise RuntimeError(
+                "Object opacity must reduce to a two-dimensional image"
+            )
+        object_mask = object_opacity.cpu().numpy() > 0.01
+        Image.fromarray((object_mask.astype(np.uint8) * 255)).save(
+            save_dir / "current_object_mask.png"
+        )
 
-    object_mask = cv2.imread(object_mask_path.as_posix(), cv2.IMREAD_GRAYSCALE)
     if object_mask is None:
-        raise RuntimeError(f"Failed to read object mask: {object_mask_path}")
-    object_mask = object_mask > 0
+        object_mask_path = kf_gen.run_dir / "segmentation" / "object_00.png"
+        if not object_mask_path.exists():
+            raise FileNotFoundError(f"Object mask not found: {object_mask_path}")
+        object_mask = cv2.imread(
+            object_mask_path.as_posix(), cv2.IMREAD_GRAYSCALE
+        )
+        if object_mask is None:
+            raise RuntimeError(f"Failed to read object mask: {object_mask_path}")
+        object_mask = object_mask > 0
 
-    depth = kf_gen.depth_latest.detach()
+    depth = (
+        annotation_depth.detach()
+        if annotation_depth is not None
+        else kf_gen.depth_latest.detach()
+    )
     if object_mask.shape != tuple(depth.shape[-2:]):
         raise RuntimeError(
             f"Object mask/depth resolution mismatch: {object_mask.shape} vs "
             f"{tuple(depth.shape[-2:])}"
         )
+    base_valid = (
+        annotation_valid_mask.bool()
+        if annotation_valid_mask is not None
+        else ~kf_gen.sky_mask_latest.bool()
+    )
     inpaint_environment_mask = (
-        (~kf_gen.sky_mask_latest.bool())
+        base_valid
         & torch.isfinite(depth)
         & (depth > 1e-6)
     )
@@ -737,7 +835,6 @@ def get_interaction_query_points(save_dir, config=None):
     interaction_mask = object_mask_tensor & inpaint_environment_mask
 
     # update_current_pc_by_kf flattens masks in (w, h, b) order.
-    base_valid = ~kf_gen.sky_mask_latest.bool()
     valid_flat = base_valid.permute(3, 2, 0, 1).reshape(-1)
     query_flat = interaction_mask.permute(3, 2, 0, 1).reshape(-1)
     query_in_environment = query_flat[valid_flat]
@@ -778,13 +875,7 @@ def generate_object_motion_hints(simulation_states, viewpoint_camera):
         raise RuntimeError("obj2env requires at least two visible Genesis states")
     object_key = "obj_0000"
     xyz_start = simulation_states[0][object_key]["xyz"]
-    xyz_end = simulation_states[-1][object_key]["xyz"]
     center_start = xyz_start.mean(dim=0, keepdim=True)
-    center_end = xyz_end.mean(dim=0, keepdim=True)
-    uv_start = proj_uv(center_start, viewpoint_camera)[0]
-    uv_end = proj_uv(center_end, viewpoint_camera)[0]
-    if not torch.isfinite(uv_start).all() or not torch.isfinite(uv_end).all():
-        raise RuntimeError("Projected object motion hint contains NaN or Inf")
 
     width = viewpoint_camera.image_width
     height = viewpoint_camera.image_height
@@ -798,18 +889,42 @@ def generate_object_motion_hints(simulation_states, viewpoint_camera):
         dtype=center_start.dtype,
         device=center_start.device,
     )
-    for label, center, uv in (
-        ("start", center_start, uv_start),
-        ("end", center_end, uv_end),
-    ):
+
+    def project_visible_center(center):
+        uv = proj_uv(center, viewpoint_camera)[0]
         camera_center = (camera_rotation @ center.T).T + camera_translation
         visible = (
             camera_center[0, 2] > 1e-6
             and 0 <= uv[0] < width
             and 0 <= uv[1] < height
         )
-        if not visible:
-            raise RuntimeError(f"obj2env {label} object center is outside the camera view")
+        return uv, bool(torch.isfinite(uv).all() and visible)
+
+    uv_start, start_visible = project_visible_center(center_start)
+    if not start_visible:
+        raise RuntimeError("obj2env start object center is outside the camera view")
+
+    # Use the last visible state as the hint endpoint when the final
+    # simulated state has already left the camera view.
+    end_state_index = None
+    uv_end = None
+    for state_index in range(len(simulation_states) - 1, 0, -1):
+        xyz_end = simulation_states[state_index][object_key]["xyz"]
+        center_end = xyz_end.mean(dim=0, keepdim=True)
+        candidate_uv, candidate_visible = project_visible_center(center_end)
+        if candidate_visible:
+            end_state_index = state_index
+            uv_end = candidate_uv
+            break
+
+    if end_state_index is None:
+        raise RuntimeError("obj2env end object center is outside the camera view")
+
+    if end_state_index != len(simulation_states) - 1:
+        print(
+            "[interaction] Final Genesis state is outside the camera view; "
+            f"using last visible state {end_state_index} as the motion hint endpoint"
+        )
 
     hint = [
         float(uv_start[0].item()),
@@ -1009,6 +1124,7 @@ def interaction_rendering(
     save_dir,
     config,
     video_gen_fps,
+    viewpoint_camera=None,
 ):
     """Render dynamic object/environment states and generate VACE RAFT flow."""
     global gaussians, opt, background
@@ -1021,7 +1137,8 @@ def interaction_rendering(
         )
     )
     num_frames = len(simulation_states)
-    viewpoint_camera = scene.getTrainCameras().copy()[0]
+    if viewpoint_camera is None:
+        viewpoint_camera = scene.getTrainCameras().copy()[0]
 
     traj_dir = save_dir / "traj_00"
     output_dir = save_dir / "interaction_motion"
@@ -1155,7 +1272,10 @@ def run_interaction_pipeline(
     config,
     simulation_steps,
     video_gen_fps,
+    viewpoint_camera=None,
+    motion_model=None,
 ):
+    global current_object_xyz
     direction, velocity_scale = validate_interaction_config(config)
     interaction = config.get("interaction", {})
     num_frames = int(config.get("interaction", {}).get("num_frames", 50))
@@ -1163,8 +1283,10 @@ def run_interaction_pipeline(
         raise ValueError("interaction.num_frames must be at least 2")
 
     if direction == "env2obj":
-        motion_model = train_interaction_motion_model(config)
-        query_points = get_interaction_query_points(save_dir, config)
+        motion_model = train_interaction_motion_model(config, motion_model)
+        query_points = get_interaction_query_points(
+            save_dir, config, viewpoint_camera=viewpoint_camera
+        )
         with torch.no_grad():
             mean_displacement = motion_model(query_points).mean(dim=0)
         renderer_velocity = velocity_scale * mean_displacement
@@ -1189,6 +1311,9 @@ def run_interaction_pipeline(
             num_frames,
             persistent_velocity=genesis_velocity,
         )
+        current_object_xyz = (
+            simulation_states[-1]["obj_0000"]["xyz"].detach().clone()
+        )
     else:
         simulation_states = collect_interaction_states(
             simulator,
@@ -1196,7 +1321,11 @@ def run_interaction_pipeline(
             simulation_steps,
             num_frames,
         )
-        viewpoint_camera = scene.getTrainCameras().copy()[0]
+        current_object_xyz = (
+            simulation_states[-1]["obj_0000"]["xyz"].detach().clone()
+        )
+        if viewpoint_camera is None:
+            viewpoint_camera = scene.getTrainCameras().copy()[0]
         generated_hints = generate_object_motion_hints(
             simulation_states,
             viewpoint_camera,
@@ -1211,7 +1340,7 @@ def run_interaction_pipeline(
             viewpoint_camera,
             save_dir / "sam3_mask.png",
         )
-        motion_model = train_interaction_motion_model(config)
+        motion_model = train_interaction_motion_model(config, motion_model)
 
         env_xyz, env_motion_mask, forward_positions = precompute_interaction_environment_positions(
             motion_model,
@@ -1237,7 +1366,9 @@ def run_interaction_pipeline(
         save_dir,
         config,
         video_gen_fps,
+        viewpoint_camera=viewpoint_camera,
     )
+    return motion_model, simulation_states
 
 
 def environment_motion_rendering(gaussians, scene, save_dir, config, video_gen_fps, sky_gaussians=None):
@@ -1537,7 +1668,13 @@ def load_oneformer():
 
 def run(config, dt_string=None):
     global view_matrix, scene_name, kf_gen, gaussians, opt, background, scene_dict, style_prompt, pt_gen
-    global sim, movement
+    global sim, movement, already_object_pts_num, current_object_xyz
+    global annotation_image, annotation_depth, annotation_valid_mask
+    already_object_pts_num = 0
+    current_object_xyz = None
+    annotation_image = None
+    annotation_depth = None
+    annotation_valid_mask = None
     ###### ------------------ Load modules ------------------ ######
 
     seeding(config["seed"])
@@ -1648,12 +1785,43 @@ def run(config, dt_string=None):
         dt_string=dt_string,
     ).to(config["device"])
 
-    content_prompt = config.get("content_prompt", "")
-    style_prompt = config.get("style_prompt", "DSLR 35mm landscape")
+    prompt_data = None
+    prompt_yaml = _repo_root / "examples" / "examples.yaml"
+    if prompt_yaml.exists():
+        prompt_data = load_example_yaml(config["example_name"], prompt_yaml)
+
+    content_prompt = config.get("content_prompt", None)
+    if content_prompt is None or str(content_prompt).strip() == "":
+        content_prompt = prompt_data.get("content_prompt") if prompt_data else None
+    if content_prompt is None or str(content_prompt).strip() == "":
+        raise ValueError(
+            "Missing scene content prompt. Add content_prompt to the scene "
+            "config or add the example to examples/examples.yaml."
+        )
+
+    style_prompt = config.get("style_prompt", None)
+    if style_prompt is None or str(style_prompt).strip() == "":
+        style_prompt = (
+            prompt_data.get("style_prompt")
+            if prompt_data
+            else "DSLR 35mm landscape"
+        )
     adaptive_negative_prompt = config.get("negative_prompt", "")
+    if adaptive_negative_prompt is None or str(adaptive_negative_prompt).strip() == "":
+        adaptive_negative_prompt = (
+            prompt_data.get("negative_prompt", "") if prompt_data else ""
+        )
     background_prompt = config.get("background", None)
-    control_text = config.get("control_text", None)
-    outdoor = config.get("outdoor", False)
+    if background_prompt is None and prompt_data:
+        background_prompt = prompt_data.get("background", None)
+    control_text = config.get(
+        "control_text",
+        prompt_data.get("control_text", None) if prompt_data else None,
+    )
+    outdoor = config.get(
+        "outdoor",
+        prompt_data.get("outdoor", False) if prompt_data else False,
+    )
     if adaptive_negative_prompt != "":
         adaptive_negative_prompt += ", "
 
@@ -1670,6 +1838,9 @@ def run(config, dt_string=None):
     start_keyframe = crop_to_square(start_keyframe)
     start_keyframe = start_keyframe.resize((512, 512))
     kf_gen.image_latest = ToTensor()(start_keyframe).unsqueeze(0).to(config["device"])
+    # Keep the raw input frame as the immutable image used for the first
+    # motion annotation.  Recomposition below may update image_latest.
+    annotation_image = kf_gen.image_latest.detach().clone()
 
     syncdiffusion_model = SyncDiffusion(config['device'], sd_version='2.0-inpaint')
     # syncdiffusion_model = None
@@ -1713,6 +1884,8 @@ def run(config, dt_string=None):
     )
 
     kf_gen.recompose_image_latest_and_set_current_pc()
+    annotation_depth = kf_gen.depth_latest.detach().clone()
+    annotation_valid_mask = (~kf_gen.sky_mask_latest.bool()).detach().clone()
 
     content_list = content_prompt.split(",")
     scene_name = content_list[0]
@@ -1785,7 +1958,7 @@ def run(config, dt_string=None):
         save_dir_sim = kf_gen.run_dir / "simulation"
         save_dir_sim.mkdir(parents=True, exist_ok=True)
         interaction_direction, _ = validate_interaction_config(config)
-        if interaction_direction == "env2obj":
+        if interaction_direction == "env2obj" and not config.get("multiview", {}).get("enabled", False):
             prepare_environment_motion_fields(save_dir_sim, config)
 
     ### First scene 3DGS
@@ -2043,7 +2216,18 @@ def run(config, dt_string=None):
         f.close()
         # train_simulation(sim, scene, save_dir_sim)
 
-        if motion_type == "interaction":
+        if motion_type == "interaction" and config.get("multiview", {}).get("enabled", False):
+            from multiview_controller import run_multiview_controller
+
+            run_multiview_controller(
+                config=config,
+                simulator=sim,
+                scene=scene,
+                save_dir=save_dir_sim,
+                simulation_steps=simulation_steps,
+                video_gen_fps=video_gen_fps,
+            )
+        elif motion_type == "interaction":
             print("=" * 60)
             print("Environment-Object Interaction")
             print("=" * 60)
@@ -2473,13 +2657,21 @@ def train_gaussian(
             gt_mask = 1.0 - no_loss_mask
             gt_mask = gt_mask.cuda()
 
-            n_trainable = scene.traindata["pcd_points"].shape[0]
+            n_trainable = gaussians.get_xyz.shape[0] - already_object_pts_num
             n_all = viewspace_point_tensor.shape[0]
-            foreground_mask = torch.zeros(n_all).to(config["device"])
+            if n_trainable <= 0 or already_object_pts_num + n_trainable > n_all:
+                raise RuntimeError(
+                    "Invalid object Gaussian range for mask supervision: "
+                    f"start={already_object_pts_num}, count={n_trainable}, total={n_all}"
+                )
+            foreground_mask = torch.zeros(
+                n_all,
+                dtype=torch.bool,
+                device=viewspace_point_tensor.device,
+            )
             foreground_mask[
                 already_object_pts_num : (already_object_pts_num + n_trainable)
-            ] = 1
-            foreground_mask = foreground_mask.bool()
+            ] = True
 
             render_foreground_pkg = render(
                 viewpoint_cam, gaussians, opt, background, render_mask=foreground_mask

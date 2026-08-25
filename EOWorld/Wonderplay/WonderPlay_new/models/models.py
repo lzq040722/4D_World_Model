@@ -3610,11 +3610,10 @@ class KeyframeGen(FrameSyn):
         pred_semantic_map=None,
         ground_ids=["3", "6", "9", "11", "13", "26", "29", "46", "52", "128"],
         foreground_ids=[4, 76, 83, 87],
+        use_precomputed_assets=True,
     ):
-        # if not isinstance(ground_ids[0], str):
-        #     ground_ids = [str(id) for id in ground_ids]
-        # if not isinstance(foreground_ids[0], str):
-        #     foreground_ids = [str(id) for id in foreground_ids]
+        ground_ids = {str(class_id) for class_id in ground_ids}
+        foreground_ids = {str(class_id) for class_id in foreground_ids}
 
         self.image_latest_init = copy.deepcopy(self.image_latest)
         self.depth_latest_init = copy.deepcopy(self.depth_latest)
@@ -3727,10 +3726,10 @@ class KeyframeGen(FrameSyn):
         You need to set in config the object_split_mask_sam_ids, and the order matters!
         then directly use those masks as object masks, no erosion or dilation, and rewrite the mask_disocclusion
         '''
-        if "object_split_mask_sam_ids" not in self.config.keys():
-            print("No object_split_mask_sam_ids in config, check the segmentation folder to select the object masks ids!!")
-            raise NotImplementedError
-        else:
+        if use_precomputed_assets:
+            if "object_split_mask_sam_ids" not in self.config.keys():
+                print("No object_split_mask_sam_ids in config, check the segmentation folder to select the object masks ids!!")
+                raise NotImplementedError
             object_split_mask_sam_ids = self.config["object_split_mask_sam_ids"]
             mask_disocclusion = np.full((512, 512), False, dtype=bool)
             self.object_masks = []
@@ -3775,7 +3774,7 @@ class KeyframeGen(FrameSyn):
             mask_disocclusion.float().to(self.device), kernel=dilation_kernel
         )
 
-        is_tmp = True
+        is_tmp = use_precomputed_assets
         _examples_dir = self.config.get("examples_dir", os.path.join("examples", "imgs", self.config["example_name"]))
         
         inpaint_mask = (

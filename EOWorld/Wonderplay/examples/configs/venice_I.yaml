@@ -25,7 +25,7 @@ enable_regenerate: False
 
 debug: True
 inpainting_resolution_gen: 512
-stable_diffusion_checkpoint: "sd2-community/stable-diffusion-2-inpainting"
+image_edit_checkpoint: "/root/autodl-tmp/huggingface/hub"
 inpainting_resolution_interp: 512
 negative_inpainting_prompt: "collage, text, writings, signs, text, white border, photograph border, artifacts, blur, blurry, foggy, fog, bad quality, distortions, distorted image, watermark, signature, fisheye look"
 
@@ -108,3 +108,10 @@ environment_motion:
     [431, 401, 355, 472]   # 第三个箭头：从 (431, 401) 到 (355, 472)
   ]
 
+## Multi-view interaction configuration
+multiview:
+  enabled: True
+  expansion_iterations: 100
+  inpainting_steps: 50
+  stop: False
+load_gen: False

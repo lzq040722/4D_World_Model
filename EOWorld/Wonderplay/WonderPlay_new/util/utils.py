@@ -25,6 +25,18 @@ import torch.nn.functional as F
 from torchvision.transforms.functional import gaussian_blur
 from scene.cameras import Camera
 
+
+def load_example_yaml(example_name, yaml_path):
+    """Load one LivingWorld-style prompt record by example name."""
+    with open(yaml_path, "r") as file:
+        data = yaml.safe_load(file)
+    yaml_data = None
+    for entry in data:
+        if entry["name"] == example_name:
+            yaml_data = entry
+            break
+    return yaml_data
+
 def convert_pt3d_cam_to_3dgs_cam(pt3d_cam: PerspectiveCameras, xyz_scale=1):
     transform_matrix_pt3d = pt3d_cam.get_world_to_view_transform().get_matrix()[0]
     transform_matrix_w2c_pt3d = transform_matrix_pt3d.transpose(0, 1)
@@ -355,6 +367,18 @@ def soft_stitching(source_img, target_img, mask, blur_size=11, sigma=2.5):
     # blur_size  # Size of the Gaussian kernel, must be odd
     # sigma       # Standard deviation of the Gaussian kernel
     
+    # Keep the blend operands on the same spatial size.
+    # Some inpaint pipelines return 1024x1024 outputs while the base frame is 512x512.
+    target_h, target_w = target_img.shape[-2:]
+    if source_img.shape[-2:] != (target_h, target_w):
+        source_img = F.interpolate(
+            source_img, size=(target_h, target_w), mode="bilinear", align_corners=False
+        )
+    if mask.shape[-2:] != (target_h, target_w):
+        mask = F.interpolate(
+            mask.float(), size=(target_h, target_w), mode="bilinear", align_corners=False
+        )
+
     # Ensure the mask is float for blurring
     soft_mask = mask.float()
 

@@ -86,9 +86,9 @@ PY
 
 转换成realwonder 所需要格式：
 CUDA_VISIBLE_DEVICES=0 python prepare_realwonder_input.py \
-  --simulation_dir 3d_result/wonderplay/venice/obj2env/simulation \
+  --simulation_dir 3d_result/wonderplay/venice/obj2env1/simulation \
   --traj_id 0 \
-  --output_dir /root/autodl-tmp/RealWonder/input_data/venice_I_obj2env/final_sim \
+  --output_dir /root/autodl-tmp/RealWonder/input_data/venice_obj2env1/final_sim \
   --num_output_frames 12 \
   --flow_format normalized \
   --overwrite
@@ -96,8 +96,8 @@ CUDA_VISIBLE_DEVICES=0 python prepare_realwonder_input.py \
 跑realwonder 视频生成模型：
 CUDA_VISIBLE_DEVICES=0 python infer_sim.py \
   --checkpoint_path 'ckpts/Realwonder-Distilled-AR-I2V-Flow/sink_size=1-attn_size=21-frame_per_block=3-denoising_steps=4/step=000800.pt' \
-  --sim_data_path input_data/venice_I_obj2env/final_sim \
-  --output_path input_data/venice_I_obj2env/final_sim/realwonder_output.mp4 \
+  --sim_data_path input_data/venice_obj2env1/final_sim \
+  --output_path input_data/vencie_obj2env1/final_sim/realwonder_output.mp4 \
   --eval_degradation 0.5 \
   --local_attn_size 21 \
   --seed 42
@@ -141,3 +141,7 @@ f_pos[..., 1] = motion_pts[None, :, 1]
 b_pos[..., 1] = motion_pts[None, :, 1]
 
 501行修改 smooth 参数 2.3-->0.5
+
+13. 8/24 交流内容：
+a. 完整的多视角交互逻辑
+b. 可以选用更少的3DGS进行模拟，最后交给视频优化就好

@@ -23,6 +23,7 @@ preservation_weight: 10
 
 #inpainting parameters
 stable_diffusion_checkpoint: "sd2-community/stable-diffusion-2-inpainting" #"dreambooth_models/mountains-sks-1500"
+image_edit_checkpoint: "/root/autodl-tmp/huggingface/hub"
 inpainting_resolution_interp: 512
 inpainting_resolution_gen: 512
 
@@ -55,5 +56,15 @@ refine_depth_conditioning: True
 camera_speed_multiplier_rotation: 0
 api_key: "Your OpenAI api_key"
 gen_sky_image: False
+use_gpt: False
+
+# LivingWorld-style multi-view interaction entry. The old run_genesis.py
+# pipeline remains unchanged unless this block is enabled by the new entry.
+multiview:
+  enabled: False
+  expansion_iterations: 100
+  inpainting_steps: 50
+  stop: False
+load_gen: False
 
 imgto3D: False

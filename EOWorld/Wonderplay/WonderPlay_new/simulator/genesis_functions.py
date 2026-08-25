@@ -9,7 +9,7 @@ def force_venice_1(obj_entity, obj_id, sid, all_entities):
 
     if obj_id == 0:
         if sid <= time_lapse:
-            force_direction = np.array([1, -0.1, 0])
+            force_direction = np.array([-1, -0.1, 0])
             force = magnitude_0 * force_direction / np.linalg.norm(force_direction)
         else:
             force = np.array([0, 0, 0])

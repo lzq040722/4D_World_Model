@@ -698,11 +698,13 @@ def render_dynamic(
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
     static_means3D = pc.get_xyz_all
     if dynamic_xyz is not None:
-        dynamic_means_3D = torch.tensor(dynamic_xyz, dtype=torch.float, device=static_means3D.device)
+        dynamic_means_3D = torch.as_tensor(
+            dynamic_xyz, dtype=static_means3D.dtype, device=static_means3D.device
+        )
         # assume object is always at the beginning
         num_object_gaussians = dynamic_means_3D.shape[0]
-        static_means3D[:num_object_gaussians] = dynamic_means_3D
-        means3D = static_means3D
+        means3D = static_means3D.clone()
+        means3D[:num_object_gaussians] = dynamic_means_3D
     else:
         means3D = static_means3D
 
@@ -747,6 +749,7 @@ def render_dynamic(
         visibility_filter_all = pc.visibility_filter_all  # Seen in screen
     else:
         visibility_filter_all = torch.ones_like(pc.visibility_filter_all, dtype=torch.bool)
+    visibility_filter_all = visibility_filter_all & ~pc.delete_mask_all
 
     if exclude_sky:
         visibility_filter_all = visibility_filter_all & ~pc.is_sky_filter
@@ -935,6 +938,7 @@ def render(viewpoint_camera, pc: GaussianModel, opt, bg_color: torch.Tensor, sca
         visibility_filter_all = pc.visibility_filter_all  # Seen in screen
     else:
         visibility_filter_all = torch.ones_like(pc.visibility_filter_all, dtype=torch.bool)
+    visibility_filter_all = visibility_filter_all & ~pc.delete_mask_all
 
     if exclude_sky:
         visibility_filter_all = visibility_filter_all & ~pc.is_sky_filter
@@ -988,4 +992,3 @@ def render(viewpoint_camera, pc: GaussianModel, opt, bg_color: torch.Tensor, sca
             "final_opacity": final_opacity,
             "depth": depth,
             "median_depth": median_depth,}
-
