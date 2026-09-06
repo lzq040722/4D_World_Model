@@ -48,6 +48,10 @@ let motionEnabled = false;
 let motionArrows = [];
 let pendingArrow = null;
 let pipelinePhase = "INITIALIZING";
+let lastDisplayedFrame = null;
+let pendingFrameInfo = null;
+let holdPreviewFrame = false;
+let activeKeys = [];
 
 start_button.disabled = true;
 generate_button.disabled = true;
@@ -126,6 +130,30 @@ function applyPipelinePhase(phase) {
         pendingArrow = null;
         redrawMotionOverlay();
     }
+}
+
+function generateFromCurrentView() {
+    if (!socket || !socket.connected) {
+        serverConnect.innerText = "Cannot generate: Socket.IO is disconnected.";
+        return;
+    }
+    const payload = {
+        view_matrix: viewMatrix.slice(),
+        displayed_frame: lastDisplayedFrame,
+    };
+    holdPreviewFrame = true;
+    activeKeys = [];
+    generate_button.disabled = true;
+    serverConnect.innerText = "Generating new scene...";
+    socket.timeout(5000).emit("gen", payload, (error, response) => {
+        if (error || !response || response.ok !== true) {
+            holdPreviewFrame = false;
+            generate_button.disabled = pipelinePhase !== "WAITING_EXPANSION";
+            serverConnect.innerText = response && response.message
+                ? response.message
+                : "Generate was not acknowledged by the server. Retry.";
+        }
+    });
 }
 
 function updatePipelineControls(state) {
@@ -371,24 +399,42 @@ function connectToServer() {
         serverConnect.innerText = "Connection to server failed. Please retry.";
     });
     
-    function drawFrame(data, mimeType) {
+    function drawFrame(data, mimeType, frameInfo = null) {
         const blob = new Blob([data], { type: mimeType });
         const imageURL = URL.createObjectURL(blob);
         const img = new Image();
         img.onload = () => {
+            if (holdPreviewFrame && (!frameInfo || frameInfo.source !== "annotation")) {
+                URL.revokeObjectURL(imageURL);
+                return;
+            }
             ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+            if (frameInfo && frameInfo.source) {
+                lastDisplayedFrame = {
+                    source: frameInfo.source,
+                    frame_index: frameInfo.frame_index,
+                };
+            }
             URL.revokeObjectURL(imageURL);
         };
         img.src = imageURL;
     }
 
+    socket.on('frame-info', (data) => {
+        pendingFrameInfo = data && typeof data === "object" ? data : null;
+    });
+
     socket.on('frame', (data) => {
+        if (holdPreviewFrame) return;
+        const frameInfo = pendingFrameInfo;
+        pendingFrameInfo = null;
         annotationImage.style.visibility = "hidden";
         canvas.style.visibility = "visible";
-        drawFrame(data, 'image/jpeg');
+        drawFrame(data, 'image/jpeg', frameInfo);
     });
 
     socket.on('annotation-frame', (data) => {
+        holdPreviewFrame = false;
         const blob = new Blob([data], { type: 'image/png' });
         const imageURL = URL.createObjectURL(blob);
         annotationImage.onload = () => URL.revokeObjectURL(imageURL);
@@ -396,7 +442,7 @@ function connectToServer() {
         annotationImage.style.visibility = "visible";
         // Draw the same fixed input frame into the canvas as a compatibility
         // path for browsers that do not repaint an image layer immediately.
-        drawFrame(data, 'image/png');
+        drawFrame(data, 'image/png', { source: "annotation", frame_index: null });
         canvas.style.visibility = "visible";
     });
 
@@ -495,7 +541,7 @@ async function main() {
     });
 
     start_button.addEventListener("click", confirmMotionAnnotations);
-    generate_button.addEventListener("click", () => socket.emit("gen", viewMatrix));
+    generate_button.addEventListener("click", generateFromCurrentView);
     undo_button.addEventListener("click", () => socket.emit("undo"));
     save_button.addEventListener("click", () => socket.emit("save"));
     fill_button.addEventListener("click", () => socket.emit("fill_hole"));
@@ -526,11 +572,11 @@ async function main() {
         socket.emit("set-scale", { value: Number(motion_scale.value) });
     });
 
-    let activeKeys = [];
     window.addEventListener("keydown", (e) => {
         const active = document.activeElement;
         const typing = active && ["INPUT", "TEXTAREA", "SELECT"].includes(active.tagName);
         if (typing) return;
+        if (holdPreviewFrame) return;
         if (e.code === "Enter" && active === document.body) confirmMotionAnnotations();
         if (e.code === "KeyR") {
             let inv = invert4(defaultViewMatrix);
@@ -548,7 +594,7 @@ async function main() {
             let movement_tmp = movement;
             storeCameraPose(viewMatrix, yaw_tmp, pitch_tmp, movement_tmp);
 
-            socket.emit('gen', viewMatrix);  // Send generate signal to the server
+            generateFromCurrentView();  // Send generate signal to the server
         }
         if (e.code === "KeyQ") {
             let inv = invert4(defaultViewMatrix);
@@ -588,7 +634,7 @@ async function main() {
             let movement_tmp = combinedMovement;
             storeCameraPose(viewMatrix, yaw_tmp, pitch_tmp, movement_tmp);
 
-            socket.emit('gen', viewMatrix);  // Send generate signal to the server
+            generateFromCurrentView();  // Send generate signal to the server
         }
         if (e.code === "KeyY") {
             let inv = invert4(defaultViewMatrix);
@@ -608,7 +654,7 @@ async function main() {
             let movement_tmp = movement;
             storeCameraPose(viewMatrix, yaw_tmp, pitch_tmp, movement_tmp);
 
-            socket.emit('gen', viewMatrix);  // Send generate signal to the server
+            generateFromCurrentView();  // Send generate signal to the server
         }
         if (e.code === "KeyU") {
             let inv = invert4(defaultViewMatrix);
@@ -628,7 +674,7 @@ async function main() {
             let movement_tmp = movement;
             storeCameraPose(viewMatrix, yaw_tmp, pitch_tmp, movement_tmp);
 
-            socket.emit('gen', viewMatrix);  // Send generate signal to the server
+            generateFromCurrentView();  // Send generate signal to the server
         }
         if (e.code === "KeyI") {
             let inv = invert4(defaultViewMatrix);
@@ -655,7 +701,7 @@ async function main() {
             let movement_tmp = combinedMovement;
             storeCameraPose(viewMatrix, yaw_tmp, pitch_tmp, movement_tmp);
 
-            socket.emit('gen', viewMatrix);  // Send generate signal to the server
+            generateFromCurrentView();  // Send generate signal to the server
         }
         if (e.code === "KeyO") {
             let inv = invert4(defaultViewMatrix);
@@ -682,7 +728,7 @@ async function main() {
             let movement_tmp = combinedMovement;
             storeCameraPose(viewMatrix, yaw_tmp, pitch_tmp, movement_tmp);
             
-            socket.emit('gen', viewMatrix);  // Send generate signal to the server
+            generateFromCurrentView();  // Send generate signal to the server
         }
         if (e.code === "KeyK") {
             let inv = invert4(defaultViewMatrix);
@@ -709,7 +755,7 @@ async function main() {
             let movement_tmp = combinedMovement;
             storeCameraPose(viewMatrix, yaw_tmp, pitch_tmp, movement_tmp);
 
-            socket.emit('gen', viewMatrix);  // Send generate signal to the server
+            generateFromCurrentView();  // Send generate signal to the server
         }
         if (e.code === "KeyL") {
             let inv = invert4(defaultViewMatrix);
@@ -736,7 +782,7 @@ async function main() {
             let movement_tmp = combinedMovement;
             storeCameraPose(viewMatrix, yaw_tmp, pitch_tmp, movement_tmp);
             
-            socket.emit('gen', viewMatrix);  // Send generate signal to the server
+            generateFromCurrentView();  // Send generate signal to the server
         }
         if (e.code === "KeyF") {
             active_camera.fx += 10; // Adjust 10 to your desired increment value

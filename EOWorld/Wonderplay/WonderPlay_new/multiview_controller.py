@@ -132,10 +132,15 @@ class ExpansionManager:
     def _emit(self, message):
         self.emit("server-state", message)
 
-    def _render_masks(self, tdgs_camera):
+    def _render_masks(self, tdgs_camera, object_xyz=None):
         g = self.genesis
         dynamic_kwargs = {}
-        if g.current_object_xyz is not None:
+        if object_xyz is not None:
+            dynamic_kwargs = {
+                "timestep": 0,
+                "movement_sim": [object_xyz],
+            }
+        elif g.current_object_xyz is not None:
             dynamic_kwargs = {
                 "timestep": 0,
                 "movement_sim": [g.current_object_xyz],
@@ -207,7 +212,7 @@ class ExpansionManager:
         outpaint_mask = dilation(outpaint_mask, kernel=torch.ones(7, 7).cuda())
         return render_pkg, condition_image, fill_mask, outpaint_mask
 
-    def expand(self, viewpoint_camera, prompt, scene_name=None):
+    def expand(self, viewpoint_camera, prompt, scene_name=None, object_xyz=None):
         g = self.genesis
         kf_gen = g.kf_gen
         self._emit("Generating new scene...")
@@ -218,7 +223,8 @@ class ExpansionManager:
             viewpoint_camera, xyz_scale=g.xyz_scale
         )
         render_pkg, condition_image, fill_mask, outpaint_mask = self._render_masks(
-            tdgs_camera
+            tdgs_camera,
+            object_xyz=object_xyz,
         )
         _save_tensor_image(condition_image, expansion_dir / "generation_condition.png")
         _save_tensor_image(fill_mask.float(), expansion_dir / "generation_fill_mask.png")
@@ -508,6 +514,7 @@ class MultiViewController:
         expansion_event,
         get_annotations,
         get_view_matrix,
+        consume_expansion_request,
         consume_scene_prompt,
         set_command_handler,
         set_pipeline_phase,
@@ -531,6 +538,7 @@ class MultiViewController:
         self.expansion_event = expansion_event
         self.get_annotations = get_annotations
         self.get_view_matrix = get_view_matrix
+        self.consume_expansion_request = consume_expansion_request
         self.runtime_lock = runtime_lock
         self.emit = emit
         self.set_pipeline_phase = set_pipeline_phase
@@ -613,8 +621,9 @@ class MultiViewController:
                 )
                 self.emit("server-state", f"Scene saved to {model_dir}")
 
-    def _current_camera(self):
-        view_matrix = self.get_view_matrix()
+    def _current_camera(self, view_matrix=None):
+        if view_matrix is None:
+            view_matrix = self.get_view_matrix()
         self.genesis.view_matrix_wonder = view_matrix
         return self.genesis.kf_gen.get_camera_by_js_view_matrix(
             view_matrix,
@@ -679,7 +688,11 @@ class MultiViewController:
             if self.config.get("multiview", {}).get("stop", False):
                 return
 
-            camera = self._current_camera()
+            expansion_request = self.consume_expansion_request()
+            camera = self._current_camera(expansion_request.get("view_matrix"))
+            expansion_object_xyz = expansion_request.get("object_xyz")
+            if expansion_object_xyz is not None:
+                self.genesis.current_object_xyz = expansion_object_xyz.detach().clone()
             prompt = self.prompt_manager.next_prompt()
             scene_name = self.prompt_manager.scene_dict.get("scene_name", "")
             if isinstance(scene_name, list):
@@ -692,7 +705,10 @@ class MultiViewController:
                     ensure_models()
                 self._gaussian_snapshot = copy.deepcopy(self.genesis.gaussians)
                 expansion_dir = self.expansion_manager.expand(
-                    camera, prompt, scene_name=scene_name
+                    camera,
+                    prompt,
+                    scene_name=scene_name,
+                    object_xyz=expansion_object_xyz,
                 )
                 if not getattr(
                     self.simulator, "supports_runtime_environment_append", False
@@ -736,6 +752,7 @@ def run_multiview_controller(
         expansion_event=hooks["expansion_event"],
         get_annotations=hooks["get_annotations"],
         get_view_matrix=hooks["get_view_matrix"],
+        consume_expansion_request=hooks["consume_expansion_request"],
         consume_scene_prompt=hooks["consume_scene_prompt"],
         set_command_handler=hooks["set_command_handler"],
         set_pipeline_phase=hooks["set_pipeline_phase"],

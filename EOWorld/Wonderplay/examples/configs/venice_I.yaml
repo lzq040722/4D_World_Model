@@ -117,3 +117,33 @@ multiview:
   inpainting_steps: 40
   stop: False
 load_gen: True
+
+# Standalone defaults previously inherited from examples/base-config.yaml.
+negative_inpainting_prompt: "collage, text, writings, signs, text, white border, photograph border, artifacts, blur, blurry, foggy, fog, bad quality, distortions, distorted image, watermark, signature, fisheye look"
+num_frames: 1
+finetune_depth_decoder: False
+decoder_learning_rate: 0.0001
+num_finetune_decoder_steps: 100
+num_finetune_decoder_steps_interp: 30
+preservation_weight: 10
+stable_diffusion_checkpoint: "sd2-community/stable-diffusion-2-inpainting"
+depth_model_learning_rate: 1e-6
+num_finetune_depth_model_steps: 200
+save_fps: 30
+sky_erode_kernel_size: 0
+ground_erode_kernel_size: 3
+dilate_mask_decoder_ft: 3
+regenerate_times: 3
+api_key: "Your OpenAI api_key"
+gen_sky_image: False
+
+# Use RealWonder's generated video as L1 supervision for the dynamic 3D scene.
+# The resulting 3D renders, rather than the generated 2D video, are sent to the UI.
+video_scene_refinement:
+  enabled: True
+  iterations_per_frame: 30
+  position_lr: 0.001
+  object_feature_lr: 0.01
+  background_feature_lr: 0.05
+  log_interval: 10
+  render_scale_modifier: 0.8

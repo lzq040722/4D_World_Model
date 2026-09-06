@@ -3322,12 +3322,7 @@ if __name__ == "__main__":
     config_path = Path(args.config)
     if not config_path.is_absolute():
         config_path = repo_root / config_path
-    base_config_path = repo_root / "examples" / "base-config.yaml"
-    if base_config_path.exists():
-        base_config = OmegaConf.load(str(base_config_path))
-        config = OmegaConf.merge(base_config, OmegaConf.load(str(config_path)))
-    else:
-        config = OmegaConf.load(str(config_path))
+    config = OmegaConf.load(str(config_path))
 
     # Ensure required config keys with defaults for one-click venice run
     OmegaConf.set_struct(config, False)

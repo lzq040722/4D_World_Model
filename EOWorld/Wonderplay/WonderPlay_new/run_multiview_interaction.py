@@ -45,9 +45,13 @@ _client_lock = threading.Lock()
 _client_ids = set()
 _annotation_lock = threading.Lock()
 _phase_lock = threading.Lock()
+_view_lock = threading.Lock()
+_playback_lock = threading.Lock()
 _pipeline_phase = "INITIALIZING"
 _phase_message = "Pipeline is initializing."
 _view_matrix = list(genesis.view_matrix_wonder)
+_expansion_request = None
+_last_emitted_frame_info = None
 _fixed_view_matrix = np.array(
     [
         [-1, 0, 0, 0],
@@ -200,7 +204,93 @@ def _review_motion_mask(image):
 
 
 def _current_view_matrix():
-    return list(_view_matrix)
+    with _view_lock:
+        return list(_view_matrix)
+
+
+def _normalise_view_matrix_payload(data):
+    if isinstance(data, dict):
+        matrix = (
+            data.get("view_matrix")
+            or data.get("viewMatrix")
+            or data.get("matrix")
+        )
+    else:
+        matrix = data
+    if matrix is None:
+        raise ValueError("Missing view matrix")
+    matrix = [float(value) for value in matrix]
+    if len(matrix) != 16:
+        raise ValueError(f"Expected 16 view-matrix values, got {len(matrix)}")
+    return matrix
+
+
+def _displayed_frame_from_payload(data):
+    if not isinstance(data, dict):
+        return None
+    frame = data.get("displayed_frame") or data.get("displayedFrame")
+    return frame if isinstance(frame, dict) else None
+
+
+def _snapshot_playback_object(displayed_frame=None):
+    global _last_emitted_frame_info
+    with _playback_lock:
+        states = list(_interaction_simulation_states)
+        if not states:
+            return {
+                "object_xyz": None,
+                "frame_index": None,
+                "frame_source": None,
+            }
+
+        frame_info = displayed_frame or _last_emitted_frame_info or {}
+        try:
+            frame_index = int(frame_info.get("frame_index"))
+        except (TypeError, ValueError):
+            frame_index = (_interaction_frame_index - 1) % len(states)
+        frame_index = max(0, min(len(states) - 1, frame_index))
+        object_xyz = states[frame_index]["obj_0000"]["xyz"].detach().clone()
+        return {
+            "object_xyz": object_xyz,
+            "frame_index": frame_index,
+            "frame_source": frame_info.get("source"),
+        }
+
+
+def _store_expansion_request(view_matrix, displayed_frame=None):
+    global _view_matrix, _expansion_request
+    playback_snapshot = _snapshot_playback_object(displayed_frame)
+    request_payload = {
+        "view_matrix": list(view_matrix),
+        **playback_snapshot,
+    }
+    with _view_lock:
+        _view_matrix = list(view_matrix)
+        _expansion_request = request_payload
+    if request_payload["object_xyz"] is not None:
+        genesis.current_object_xyz = request_payload["object_xyz"].detach().clone()
+        print(
+            "[multiview] Expansion locked to displayed playback "
+            f"frame={request_payload['frame_index']} "
+            f"source={request_payload['frame_source']}",
+            flush=True,
+        )
+
+
+def _consume_expansion_request():
+    global _expansion_request
+    with _view_lock:
+        request_payload = _expansion_request
+        _expansion_request = None
+        fallback_view_matrix = list(_view_matrix)
+    if request_payload is None:
+        return {
+            "view_matrix": fallback_view_matrix,
+            "object_xyz": None,
+            "frame_index": None,
+            "frame_source": None,
+        }
+    return request_payload
 
 
 def _clicks_to_hints(clicks):
@@ -257,14 +347,15 @@ def _set_interaction_preview(motion_model, simulation_states):
     global _interaction_motion_model, _interaction_simulation_states
     global _interaction_frame_index, _interaction_last_emit, _annotation_live_preview
     global _interaction_fps
-    _interaction_motion_model = motion_model
-    _interaction_simulation_states = list(simulation_states or [])
-    if _interaction_simulation_states:
-        refinement = _interaction_simulation_states[0].get("_video_refinement")
-        if refinement is not None:
-            _interaction_fps = float(refinement.get("fps", _interaction_fps))
-    _interaction_frame_index = 0
-    _interaction_last_emit = 0.0
+    with _playback_lock:
+        _interaction_motion_model = motion_model
+        _interaction_simulation_states = list(simulation_states or [])
+        if _interaction_simulation_states:
+            refinement = _interaction_simulation_states[0].get("_video_refinement")
+            if refinement is not None:
+                _interaction_fps = float(refinement.get("fps", _interaction_fps))
+        _interaction_frame_index = 0
+        _interaction_last_emit = 0.0
     print(
         "[multiview] Interaction preview ready: "
         f"{len(_interaction_simulation_states)} frame state(s).",
@@ -299,13 +390,25 @@ def _clear_interaction_preview():
     global _refined_preview_frames, _refined_frame_index
     global _interaction_motion_model, _interaction_simulation_states
     global _interaction_frame_index, _interaction_last_emit, _annotation_live_preview
-    _interaction_motion_model = None
-    _interaction_simulation_states = []
-    _interaction_frame_index = 0
-    _interaction_last_emit = 0.0
-    _refined_preview_frames = []
-    _refined_frame_index = 0
-    _annotation_live_preview = False
+    global _last_emitted_frame_info
+    with _playback_lock:
+        _interaction_motion_model = None
+        _interaction_simulation_states = []
+        _interaction_frame_index = 0
+        _interaction_last_emit = 0.0
+        _refined_preview_frames = []
+        _refined_frame_index = 0
+        _annotation_live_preview = False
+        _last_emitted_frame_info = None
+
+
+def _emit_frame(frame_bytes, source, frame_index=None):
+    global _last_emitted_frame_info
+    frame_info = {"source": source, "frame_index": frame_index}
+    with _playback_lock:
+        _last_emitted_frame_info = frame_info
+    _emit("frame-info", frame_info)
+    _emit("frame", frame_bytes)
 
 
 def _set_annotation_live_preview(enabled):
@@ -331,6 +434,7 @@ def get_runtime_hooks():
         "expansion_event": _expansion_event,
         "get_annotations": _get_annotations,
         "get_view_matrix": _current_view_matrix,
+        "consume_expansion_request": _consume_expansion_request,
         "consume_scene_prompt": _consume_scene_prompt,
         "set_command_handler": _set_command_handler,
         "set_pipeline_phase": _set_pipeline_phase,
@@ -382,18 +486,27 @@ def _handle_start(data=None):
 @socketio.on("render-pose")
 def handle_render_pose(data):
     global _view_matrix
-    _view_matrix = list(data)
-    genesis.view_matrix_wonder = list(data)
+    try:
+        view_matrix = _normalise_view_matrix_payload(data)
+    except (TypeError, ValueError) as exc:
+        return {"ok": False, "message": str(exc)}
+    with _view_lock:
+        _view_matrix = list(view_matrix)
+    genesis.view_matrix_wonder = list(view_matrix)
+    return {"ok": True}
 
 
 @socketio.on("gen")
 def handle_gen(data):
-    global _view_matrix
     phase, phase_message = _get_pipeline_phase()
     if phase != "WAITING_EXPANSION":
         return {"ok": False, "message": f"Generate rejected: {phase_message}"}
-    _view_matrix = list(data)
-    genesis.view_matrix = list(data)
+    try:
+        view_matrix = _normalise_view_matrix_payload(data)
+    except (TypeError, ValueError) as exc:
+        return {"ok": False, "message": str(exc)}
+    _store_expansion_request(view_matrix, _displayed_frame_from_payload(data))
+    genesis.view_matrix = list(view_matrix)
     _clear_interaction_preview()
     _set_pipeline_phase("PROCESSING", "Generating new scene...")
     _expansion_event.set()
@@ -730,7 +843,7 @@ def render_current_scene():
                 with _frame_lock:
                     preview_frame_bytes = _preview_frame_bytes
                 if preview_frame_bytes is not None:
-                    _emit("frame", preview_frame_bytes)
+                    _emit_frame(preview_frame_bytes, "annotation")
                 time.sleep(0.05)
                 continue
             if genesis.kf_gen is None or genesis.gaussians is None:
@@ -747,7 +860,7 @@ def render_current_scene():
                 image_np, frame_bytes = _refined_preview_frames[frame_index]
                 _refined_frame_index = (frame_index + 1) % len(_refined_preview_frames)
                 _record_preview_frame(image_np)
-                _emit("frame", frame_bytes)
+                _emit_frame(frame_bytes, "refined", frame_index)
                 _interaction_last_emit = now
                 time.sleep(0.03)
                 continue
@@ -788,7 +901,9 @@ def render_current_scene():
                     can_emit_annotation_preview
                     or phase not in {"PREPARING_ANNOTATION", "WAITING_ANNOTATION"}
                 ):
-                    _emit("frame", rendered_frame)
+                    frame_source = "interaction" if has_interaction_preview else "static"
+                    emitted_frame_index = frame_index if has_interaction_preview else None
+                    _emit_frame(rendered_frame, frame_source, emitted_frame_index)
                     _emit("viz", rendered_viz)
                     _interaction_last_emit = now
         except Exception as exc:
@@ -810,6 +925,7 @@ def run(config, prefix=None, port=5000):
     global _pipeline_phase, _phase_message, _scale_factor, _sam_prompt
     global _interaction_motion_model, _interaction_simulation_states
     global _interaction_frame_index, _interaction_last_emit, _annotation_live_preview
+    global _expansion_request, _last_emitted_frame_info
     genesis_runtime_config = config
     config["multiview"]["enabled"] = True
     config["multiview"]["stop"] = False
@@ -823,6 +939,8 @@ def run(config, prefix=None, port=5000):
     _interaction_frame_index = 0
     _interaction_last_emit = 0.0
     _annotation_live_preview = False
+    _expansion_request = None
+    _last_emitted_frame_info = None
     _pipeline_phase = "INITIALIZING"
     _phase_message = "Pipeline is initializing."
     _sam_prompt = str(config.get("environment_motion", {}).get("sam_prompt", "water"))
@@ -879,14 +997,7 @@ def main():
     config_path = Path(args.config)
     if not config_path.is_absolute():
         config_path = repo_root / config_path
-    base_config_path = repo_root / "examples" / "base-config.yaml"
-    if base_config_path.exists():
-        config = OmegaConf.merge(
-            OmegaConf.load(str(base_config_path)),
-            OmegaConf.load(str(config_path)),
-        )
-    else:
-        config = OmegaConf.load(str(config_path))
+    config = OmegaConf.load(str(config_path))
 
     OmegaConf.set_struct(config, False)
     if "runs_dir" not in config:
