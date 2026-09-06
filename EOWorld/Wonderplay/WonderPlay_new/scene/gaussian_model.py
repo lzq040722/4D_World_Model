@@ -200,6 +200,33 @@ class GaussianModel:
             self.delete_mask_all = torch.empty(0, dtype=torch.bool).cuda()
         self._scene_flow = torch.empty((0, 3), device="cuda")
         self._motion_mask = torch.empty((0, 1), dtype=torch.bool, device="cuda")
+        self._ensure_metadata_lengths()
+
+    def _resize_bool_metadata(self, value, target_count, default=False):
+        value = value.detach().to(device="cuda", dtype=torch.bool).flatten()
+        if value.shape[0] == target_count:
+            return value
+        if value.shape[0] > target_count:
+            return value[:target_count]
+        fill = torch.full(
+            (target_count - value.shape[0],),
+            bool(default),
+            dtype=torch.bool,
+            device="cuda",
+        )
+        return torch.cat((value, fill), dim=0)
+
+    def _ensure_metadata_lengths(self):
+        target_count = self.get_xyz_all.shape[0]
+        self.visibility_filter_all = self._resize_bool_metadata(
+            self.visibility_filter_all, target_count, default=False
+        )
+        self.is_sky_filter = self._resize_bool_metadata(
+            self.is_sky_filter, target_count, default=False
+        )
+        self.delete_mask_all = self._resize_bool_metadata(
+            self.delete_mask_all, target_count, default=False
+        )
 
     def capture(self):
         return (
@@ -1677,6 +1704,7 @@ class GaussianModel:
         )[:, None]
 
         self.active_sh_degree = self.max_sh_degree
+        self._ensure_metadata_lengths()
 
         # obj 4d representation
         for t_idx in range(num_frames):

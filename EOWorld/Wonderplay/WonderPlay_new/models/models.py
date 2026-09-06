@@ -112,6 +112,7 @@ class FrameSyn(torch.nn.Module):
         normal_estimator=None,
         mvdiffusion=None,
         sam_model=None,
+        load_instantmesh=True,
     ):
         """This module implement following tasks that are exactly the same in both keyframe generation and new view generation:
         1. Inpainting
@@ -205,8 +206,18 @@ class FrameSyn(torch.nn.Module):
         self.mvdiffusion_steps = 75
         self.sam_model = sam_model
 
+        self.instantmesh = None
+        self.instantmesh_infer_config = None
+        self.instantmesh_azimuth = np.array([30, 90, 150, 210, 270, 330]).astype(float)
+        self.instantmesh_elevation = np.array([20, -10, 20, -10, 20, -10]).astype(float)
+        self.instantmesh_radius = 4.0 * 1.0
+        if load_instantmesh:
+            self._load_instantmesh()
+
+    def _load_instantmesh(self):
+        if self.instantmesh is not None:
+            return
         # InstantMesh: config uses target "src.models.lrm_mesh.InstantMesh" so src must be importable.
-        # Add instantmesh_module to sys.path (without changing the yaml).
         _instantmesh_dir = Path(__file__).resolve().parent.parent / "instantmesh_module"
         _instantmesh_str = str(_instantmesh_dir)
         if _instantmesh_str not in sys.path:
@@ -710,9 +721,12 @@ class FrameSyn(torch.nn.Module):
         inpainting_prompt=None,
         negative_prompt=None,
         mask_strategy=np.min,
-        diffusion_steps=50,
+        diffusion_steps=40,
         image_edit_input=None,
+        inpaint_context="generic",
     ):
+        uses_image_edit = getattr(self.inpainting_pipeline, "uses_image_edit", False)
+
         # set resolution
         if self.inpainting_resolution > 512 and rendered_image.shape[-1] == 512:
             padded_inpainting_mask = self.border_mask.clone()
@@ -740,7 +754,8 @@ class FrameSyn(torch.nn.Module):
         fill_mask = padded_inpainting_mask if fill_mask is None else fill_mask
         fill_mask_ = (fill_mask[0, 0].cpu().numpy() * 255).astype(np.uint8)
         mask = (padded_inpainting_mask[0, 0].cpu().numpy() * 255).astype(np.uint8)
-        img, _ = functbl[fill_mode](img, fill_mask_)
+        if not uses_image_edit:
+            img, _ = functbl[fill_mode](img, fill_mask_)
 
         # process mask original
         mask_block_size = 8
@@ -775,20 +790,45 @@ class FrameSyn(torch.nn.Module):
         if image_edit_input is not None:
             image_edit_image = Image.open(image_edit_input).convert("RGB")
 
-        inpainted_image = self.inpainting_pipeline(
+        guidance_scale = 0 if self.use_noprompt else 7.5
+        image_edit_kwargs = {}
+        if uses_image_edit:
+            guidance_scale = (
+                0
+                if self.use_noprompt
+                else float(self.config.get("image_edit_guidance_scale", 3.0))
+            )
+            image_edit_kwargs = {
+                "true_cfg_scale": float(
+                    self.config.get("image_edit_true_cfg_scale", 7.0)
+                ),
+                "strength": float(self.config.get("image_edit_strength", 0.95)),
+            }
+
+        prompt_for_log = "" if self.use_noprompt else self.inpainting_prompt
+        print(
+            f"[Inpaint][{inpaint_context}] prompt: {prompt_for_log}",
+            flush=True,
+        )
+
+        inpainting_inputs = dict(
             prompt="" if self.use_noprompt else self.inpainting_prompt,
             negative_prompt=negative_prompt,
             image=image_edit_image,
             num_inference_steps=diffusion_steps,
-            guidance_scale=0 if self.use_noprompt else 7.5,
+            guidance_scale=guidance_scale,
             height=self.inpainting_resolution,
             width=self.inpainting_resolution,
             self_guidance=self_guidance,
             inpaint_mask=~padded_inpainting_mask.bool(),
             rendered_image=padded_rendered_image,
-        ).images[0]
+            **image_edit_kwargs,
+        )
+        if not getattr(self.inpainting_pipeline, "uses_image_edit", False):
+            inpainting_inputs["mask_image"] = mask_image
 
-        # [1, 3, 512, 512]
+        inpainted_image = self.inpainting_pipeline(**inpainting_inputs).images[0]
+
         inpainted_image = (
             (inpainted_image / 2 + 0.5).clamp(0, 1).to(torch.float32)[None]
         )
@@ -854,8 +894,11 @@ class FrameSyn(torch.nn.Module):
         point_depth = rearrange(depth, "b c h w -> (w h b) c")
         new_points_3d = kf_camera.unproject(self.points, point_depth)
 
+        # Cinemagraphy/OpenCV flow is already in image coordinates:
+        # +x points right and +y points down.  ``convert_pytorch3d_kornia``
+        # converts the PyTorch3D camera axes to the same convention, so do
+        # not negate either flow component here.
         flow_for_points = flow.detach().clone().to(self.device)
-        flow_for_points[:, 0] *= -1
         flow_for_points = flow_for_points.squeeze(0).permute(2, 1, 0)
         flow_points = (
             torch.stack(
@@ -1108,6 +1151,13 @@ class FrameSyn(torch.nn.Module):
             with open(Path(self.run_dir) / "config.yaml", "w") as f:
                 OmegaConf.save(self.config, f)
 
+    def _archived_camera_for_frame_index(self, frame_index, use_only_latest_frame):
+        if not self.cameras_archive:
+            raise IndexError("No archived cameras are available for 3DGS traindata")
+        if use_only_latest_frame:
+            return self.cameras_archive[-1]
+        return self.cameras_archive[frame_index]
+
     @torch.no_grad()
     def increment_kf_idx(self):
         self.kf_idx += 1
@@ -1313,8 +1363,11 @@ class FrameSyn(torch.nn.Module):
                 continue
             image = ToPILImage()(img[0])
             no_loss_mask = self.no_loss_masks[i][0] if use_no_loss_mask else None
+            archived_camera = self._archived_camera_for_frame_index(
+                i, use_only_latest_frame
+            )
             transform_matrix_pt3d = (
-                self.cameras_archive[i].get_world_to_view_transform().get_matrix()[0]
+                archived_camera.get_world_to_view_transform().get_matrix()[0]
             )
             transform_matrix_w2c_pt3d = transform_matrix_pt3d.transpose(0, 1)
             transform_matrix_w2c_pt3d[:3, 3] *= xyz_scale
@@ -1399,8 +1452,11 @@ class FrameSyn(torch.nn.Module):
             if use_only_latest_frame and i != len(images) - 1:
                 continue
             image = ToPILImage()(img[0])
+            archived_camera = self._archived_camera_for_frame_index(
+                i, use_only_latest_frame
+            )
             transform_matrix_pt3d = (
-                self.cameras_archive[i].get_world_to_view_transform().get_matrix()[0]
+                archived_camera.get_world_to_view_transform().get_matrix()[0]
             )
             transform_matrix_w2c_pt3d = transform_matrix_pt3d.transpose(0, 1)
             transform_matrix_w2c_pt3d[:3, 3] *= xyz_scale
@@ -1461,8 +1517,11 @@ class FrameSyn(torch.nn.Module):
             if use_only_latest_frame and i != len(images) - 1:
                 continue
             image = ToPILImage()(img[0])
+            archived_camera = self._archived_camera_for_frame_index(
+                i, use_only_latest_frame
+            )
             transform_matrix_pt3d = (
-                self.cameras_archive[i].get_world_to_view_transform().get_matrix()[0]
+                archived_camera.get_world_to_view_transform().get_matrix()[0]
             )
             transform_matrix_w2c_pt3d = transform_matrix_pt3d.transpose(0, 1)
             transform_matrix_w2c_pt3d[:3, 3] *= xyz_scale
@@ -1532,10 +1591,11 @@ class FrameSyn(torch.nn.Module):
                 if use_only_latest_frame and i != len(images) - 1:
                     continue
                 image = ToPILImage()(img[0])
+                archived_camera = self._archived_camera_for_frame_index(
+                    i, use_only_latest_frame
+                )
                 transform_matrix_pt3d = (
-                    self.cameras_archive[i]
-                    .get_world_to_view_transform()
-                    .get_matrix()[0]
+                    archived_camera.get_world_to_view_transform().get_matrix()[0]
                 )
                 transform_matrix_w2c_pt3d = transform_matrix_pt3d.transpose(0, 1)
                 transform_matrix_w2c_pt3d[:3, 3] *= xyz_scale
@@ -1602,8 +1662,11 @@ class FrameSyn(torch.nn.Module):
             if use_only_latest_frame and i != len(images) - 1:
                 continue
             image = ToPILImage()(img[0])
+            archived_camera = self._archived_camera_for_frame_index(
+                i, use_only_latest_frame
+            )
             transform_matrix_pt3d = (
-                self.cameras_archive[i].get_world_to_view_transform().get_matrix()[0]
+                archived_camera.get_world_to_view_transform().get_matrix()[0]
             )
             transform_matrix_w2c_pt3d = transform_matrix_pt3d.transpose(0, 1)
             transform_matrix_w2c_pt3d[:3, 3] *= xyz_scale
@@ -1722,8 +1785,9 @@ class FrameSyn(torch.nn.Module):
         new_normals = rearrange(normals, "b c h w -> (w h b) c")
         new_points_3d = kf_camera.unproject(self.points, point_depth)
         if flow is not None:
+            # Flow is expressed in image pixels (+x right, +y down), matching
+            # the Kornia camera returned by ``convert_pytorch3d_kornia``.
             flow_for_points = flow.detach().clone().to(self.device)
-            flow_for_points[:, 0] *= -1
             flow_for_points = flow_for_points.squeeze(0).permute(2, 1, 0)
             flow_points = (
                 torch.stack(
@@ -2811,6 +2875,7 @@ class KeyframeGen(FrameSyn):
         inpainting_resolution=None,
         mvdiffusion=None,
         sam_model=None,
+        load_instantmesh=True,
         dt_string: Optional[str] = None,
     ):
         """This class is for generating keyframes. It inherits from FrameSyn. It implements the following tasks:
@@ -2826,6 +2891,7 @@ class KeyframeGen(FrameSyn):
             normal_estimator=normal_estimator,
             mvdiffusion=mvdiffusion,
             sam_model=sam_model,
+            load_instantmesh=load_instantmesh,
         )
 
         ####### Set up placeholder attributes #######
@@ -2893,12 +2959,18 @@ class KeyframeGen(FrameSyn):
         self.inpainting_resolution = inpainting_resolution
 
     @torch.no_grad()
-    def get_camera_at_origin(self):
+    def get_camera_at_origin(self, big_view=False):
         K = torch.zeros((1, 4, 4), device=self.device)
-        K[0, 0, 0] = self.init_focal_length
-        K[0, 1, 1] = self.init_focal_length
-        K[0, 0, 2] = 256
-        K[0, 1, 2] = 256
+        if big_view:
+            K[0, 0, 0] = 500
+            K[0, 1, 1] = 500
+            K[0, 0, 2] = 768
+            K[0, 1, 2] = 256
+        else:
+            K[0, 0, 0] = self.init_focal_length
+            K[0, 1, 1] = self.init_focal_length
+            K[0, 0, 2] = 256
+            K[0, 1, 2] = 256
         K[0, 2, 3] = 1
         K[0, 3, 2] = 1
         R = torch.eye(3, device=self.device).unsqueeze(0)
@@ -2909,9 +2981,11 @@ class KeyframeGen(FrameSyn):
         return camera
 
     @torch.no_grad()
-    def recompose_image_latest_and_set_current_pc(self):
+    def recompose_image_latest_and_set_current_pc(
+        self, use_cached_assets=False, scene_name=None
+    ):
         self.set_current_camera(self.get_camera_at_origin(), archive_camera=True)
-        sem_map = self.update_sky_mask()
+        sem_map = self.update_sky_mask(use_cached_assets=use_cached_assets)
         render_output = self.render(render_sky=True)
 
         '''
@@ -2937,15 +3011,27 @@ class KeyframeGen(FrameSyn):
             depth_should_be_ground < 0.006 * 0.8
         )
 
-        with torch.no_grad():
-            depth_guided, _ = self.get_depth(
-                self.image_latest,
-                archive_output=True,
-                target_depth=depth_should_be_ground,
-                mask_align=(ground_mask & ground_outputable_mask),
-                diffusion_steps=30,
-                guidance_steps=8,
+        depth_cache_path = Path(self.config["examples_dir"]) / "depth_initial.pt"
+        disparity_cache_path = Path(self.config["examples_dir"]) / "disparity_initial.pt"
+        if use_cached_assets and depth_cache_path.is_file() and disparity_cache_path.is_file():
+            self.depth_latest = torch.load(depth_cache_path, map_location=self.device)
+            self.disparity_latest = torch.load(
+                disparity_cache_path, map_location=self.device
             )
+            depth_guided = self.depth_latest
+            print(f"[cache] Loaded initial depth from {depth_cache_path}")
+        else:
+            with torch.no_grad():
+                depth_guided, _ = self.get_depth(
+                    self.image_latest,
+                    archive_output=True,
+                    target_depth=depth_should_be_ground,
+                    mask_align=(ground_mask & ground_outputable_mask),
+                    diffusion_steps=30,
+                    guidance_steps=8,
+                )
+            torch.save(self.depth_latest.detach().cpu(), depth_cache_path)
+            torch.save(self.disparity_latest.detach().cpu(), disparity_cache_path)
         self.refine_disp_with_segments(
             no_refine_mask=ground_mask.squeeze().cpu().numpy()
         )
@@ -2980,6 +3066,8 @@ class KeyframeGen(FrameSyn):
                 pred_semantic_map=sem_map,
                 foreground_ids=self.config["foreground_ids"],
                 ground_ids=ground_ids,
+                scene_name=scene_name,
+                use_cached_assets=use_cached_assets,
             )
             depth_should_be = self.depth_latest_init
             mask_to_align_depth = ~(self.mask_disocclusion.bool()) & (
@@ -3029,8 +3117,8 @@ class KeyframeGen(FrameSyn):
             save_depth_map(self.depth_latest[0, 0].cpu().numpy(), self.run_dir / f"{self.kf_idx:02d}_depth_inpainted.png", vmax=0.006, vmin=0)
 
             # self.depth_latest = self.mask_disocclusion * self.depth_latest + (1-self.mask_disocclusion) * self.depth_latest_init
-            self.update_sky_mask()
-            self.update_sky_mask()
+            self.update_sky_mask(use_cached_assets=use_cached_assets)
+            self.update_sky_mask(use_cached_assets=use_cached_assets)
             self.update_current_pc_by_kf(
                 image=self.image_latest,
                 depth=self.depth_latest,
@@ -3421,7 +3509,7 @@ class KeyframeGen(FrameSyn):
         return
 
     @torch.no_grad()
-    def get_camera_by_js_view_matrix(self, view_matrix, xyz_scale=1.0):
+    def get_camera_by_js_view_matrix(self, view_matrix, xyz_scale=1.0, big_view=False):
         """
         args:
             view_matrix: list of 16 elements, representing the view matrix of the camera
@@ -3441,21 +3529,67 @@ class KeyframeGen(FrameSyn):
         view_matrix_negate_xy = view_matrix @ xy_negate_matrix
         R = view_matrix_negate_xy[:3, :3].unsqueeze(0)
         T = view_matrix_negate_xy[3, :3].unsqueeze(0)
-        camera = self.get_camera_at_origin()
+        camera = self.get_camera_at_origin(big_view=big_view)
         camera.R = R
         camera.T = T / xyz_scale
         return camera
 
     @torch.no_grad()
-    def update_sky_mask(self):
+    def update_sky_mask(
+        self,
+        cached_sky_mask=None,
+        cached_semantic_map=None,
+        use_cached_assets=False,
+    ):
         sky_mask_latest, sem_seg = self.generate_sky_mask(
-            self.image_latest, return_sem_seg=True
+            self.image_latest,
+            return_sem_seg=True,
+            cached_sky_mask=cached_sky_mask,
+            cached_semantic_map=cached_semantic_map,
+            use_cached_assets=use_cached_assets,
         )
         self.sky_mask_latest = sky_mask_latest[None, None, :]
         return sem_seg
 
     @torch.no_grad()
-    def generate_sky_mask(self, input_image=None, return_sem_seg=False):
+    def generate_sky_mask(
+        self,
+        input_image=None,
+        return_sem_seg=False,
+        cached_sky_mask=None,
+        cached_semantic_map=None,
+        use_cached_assets=False,
+    ):
+        examples_dir = Path(self.config.get("examples_dir", ""))
+        semantic_cache = examples_dir / "semantic_map.pt"
+        sky_cache = examples_dir / "sky_mask.pt"
+        if use_cached_assets:
+            if cached_semantic_map is None and semantic_cache.is_file():
+                cached_semantic_map = torch.load(
+                    semantic_cache, map_location=self.device
+                )
+            if cached_sky_mask is None and sky_cache.is_file():
+                cached_sky_mask = torch.load(sky_cache, map_location=self.device)
+            if cached_semantic_map is not None:
+                pred_semantic_map = cached_semantic_map.to(self.device).long()
+                sky_mask = pred_semantic_map == 2
+                if self.sky_erode_kernel_size > 0:
+                    sky_mask = (
+                        erosion(
+                            sky_mask.float()[None, None],
+                            kernel=torch.ones(
+                                self.sky_erode_kernel_size,
+                                self.sky_erode_kernel_size,
+                            ).to(self.device),
+                        ).squeeze()
+                        > 0.5
+                    )
+                if cached_sky_mask is not None:
+                    sky_mask = cached_sky_mask.to(self.device).bool()
+                if return_sem_seg:
+                    return sky_mask, pred_semantic_map
+                return sky_mask
+
         if input_image is not None:
             image = ToPILImage()(input_image.squeeze())
         else:
@@ -3482,6 +3616,10 @@ class KeyframeGen(FrameSyn):
                 ).squeeze()
                 > 0.5
             )
+        if use_cached_assets:
+            examples_dir.mkdir(parents=True, exist_ok=True)
+            torch.save(pred_semantic_map.detach().cpu(), semantic_cache)
+            torch.save(sky_mask.detach().cpu(), sky_cache)
         if return_sem_seg:
             return sky_mask, pred_semantic_map
         else:
@@ -3610,7 +3748,9 @@ class KeyframeGen(FrameSyn):
         pred_semantic_map=None,
         ground_ids=["3", "6", "9", "11", "13", "26", "29", "46", "52", "128"],
         foreground_ids=[4, 76, 83, 87],
+        scene_name=None,
         use_precomputed_assets=True,
+        use_cached_assets=False,
     ):
         ground_ids = {str(class_id) for class_id in ground_ids}
         foreground_ids = {str(class_id) for class_id in foreground_ids}
@@ -3650,16 +3790,46 @@ class KeyframeGen(FrameSyn):
         # also use SAM to generate the masks candiate
         image_pil = ToPILImage()(self.image_latest.squeeze())
         image_np = np.array(image_pil)
-        sam_masks = self.mask_generator.generate(image_np)
-        sam_masks_np = {}
-        for sid, sam_mask in enumerate(sam_masks):
-            if sam_mask['area'] < 100:
-                continue
-            sam_masks_np[sid] = sam_mask['segmentation']   # (512, 512) bool numpy array
-            sam_mask = sam_mask['segmentation'] * 255
-            sam_mask = sam_mask.astype(np.uint8)
-            cv2.imwrite((self.run_dir / f"segmentation/sam_mask_{sid:02d}.png").as_posix(), sam_mask)
-            cv2.imwrite((self.run_dir / f"segmentation/sam_mask_{sid:02d}_rgb.png").as_posix(), (sam_mask[:,:,None]/255).astype(np.uint8) * image_np[:,:,[2,1,0]])
+        sam_cache_path = Path(self.config["examples_dir"]) / "sam_masks.pt"
+        if use_cached_assets and sam_cache_path.is_file():
+            sam_masks_np = torch.load(
+                sam_cache_path, map_location="cpu", weights_only=False
+            )
+            sam_masks_np = {
+                int(sid): (
+                    mask.detach().cpu().numpy()
+                    if torch.is_tensor(mask)
+                    else np.asarray(mask)
+                ).astype(bool)
+                for sid, mask in sam_masks_np.items()
+            }
+            print(f"[cache] Loaded SAM masks from {sam_cache_path}")
+        else:
+            sam_masks = self.mask_generator.generate(image_np)
+            sam_masks_np = {}
+            for sid, sam_mask in enumerate(sam_masks):
+                if sam_mask['area'] < 100:
+                    continue
+                sam_masks_np[sid] = sam_mask['segmentation']
+                sam_mask_image = (sam_mask['segmentation'] * 255).astype(np.uint8)
+                cv2.imwrite(
+                    (self.run_dir / f"segmentation/sam_mask_{sid:02d}.png").as_posix(),
+                    sam_mask_image,
+                )
+                cv2.imwrite(
+                    (self.run_dir / f"segmentation/sam_mask_{sid:02d}_rgb.png").as_posix(),
+                    (sam_mask_image[:, :, None] / 255).astype(np.uint8)
+                    * image_np[:, :, [2, 1, 0]],
+                )
+            if use_cached_assets:
+                sam_cache_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(
+                    {
+                        sid: torch.from_numpy(mask.astype(bool))
+                        for sid, mask in sam_masks_np.items()
+                    },
+                    sam_cache_path,
+                )
 
         for id, mask in masks.items():
             # exclude 3: floor; 6: road; 9: grass; 11: pavement; 13: earth; 26: sea; 29: field; 46: sand; 52: path, 128: lake
@@ -3760,10 +3930,16 @@ class KeyframeGen(FrameSyn):
                 self.object_masks.append(torch.from_numpy(combined_mask).float().unsqueeze(0).unsqueeze(0).to(self.device))
         cv2.imwrite((self.run_dir / f"segmentation/sam_mask_disocclusion.png").as_posix(), (mask_disocclusion*255).astype(np.uint8))
         
-        inpainting_prompt = self.config["base_inpainting_prompt"]
-        inpainting_negative_prompt = self.config["base_inpainting_negative_prompt"]
-        print("Base layer inpainting_prompt: ", inpainting_prompt)
-        print("Base layer inpainting_negative_prompt: ", inpainting_negative_prompt)
+        inpainting_prompt = (
+            scene_name
+            if scene_name is not None
+            else self.config["base_inpainting_prompt"]
+        )
+        inpainting_negative_prompt = (
+            "tree, plant"
+            if scene_name is not None
+            else self.config.get("base_inpainting_negative_prompt", "tree, plant")
+        )
         mask_disocclusion = torch.from_numpy(mask_disocclusion)[None, None]
 
         """Outside of this function, mask_disocclusion will be used to update point cloud and compute depth; 
@@ -3799,35 +3975,44 @@ class KeyframeGen(FrameSyn):
             "[INFO] Saved foreground-removal visualizations to "
             f"{segmentation_dir / 'foreground_removed_hole.png'}"
         )
-        self.inpaint(
-            self.image_latest_init,
-            inpaint_mask=inpaint_mask,
-            inpainting_prompt=inpainting_prompt,
-            negative_prompt=inpainting_negative_prompt,
-            mask_strategy=np.max,
-            diffusion_steps=50,
-            image_edit_input=segmentation_dir / "foreground_removed_hole.png",
-        )
-        inpainter_output = self.image_latest
+        _base_layer_path = Path(_examples_dir) / "base_layer.png"
+        if use_cached_assets and _base_layer_path.is_file():
+            inpainter_output = ToTensor()(
+                Image.open(_base_layer_path).convert("RGB").resize((512, 512))
+            )[None].to(self.device)
+            print(f"[cache] Loaded inpaint image from {_base_layer_path}")
+        else:
+            self.inpaint(
+                self.image_latest_init,
+                inpaint_mask=inpaint_mask,
+                inpainting_prompt=inpainting_prompt,
+                negative_prompt=inpainting_negative_prompt,
+                mask_strategy=np.max,
+                diffusion_steps=40,
+                image_edit_input=segmentation_dir / "foreground_removed_hole.png",
+                inpaint_context="initial/base-layer foreground removal",
+            )
+            inpainter_output = self.image_latest
 
         stitch_mask = dilation(
             mask_disocclusion.float().to(self.device),
             kernel=torch.ones(5, 5).to(self.device),
         )  # keep it slightly dilated to prevent dirty artifacts
         
-        if is_tmp:
-            _base_layer_path = os.path.join(_examples_dir, "base_layer.png")
-            if os.path.exists(_base_layer_path):
-                inpainter_output = ToTensor()(
-                    Image.open(_base_layer_path).resize((512, 512))
-                )[None].to(self.device)
-                stitch_mask = dilation(
-                    mask_disocclusion.float().to(self.device),
-                    kernel=torch.ones(7, 7).to(self.device),
-                )  # keep it slightly dilated to prevent dirty artifacts
+        if is_tmp and _base_layer_path.exists() and not use_cached_assets:
+            inpainter_output = ToTensor()(
+                Image.open(_base_layer_path).convert("RGB").resize((512, 512))
+            )[None].to(self.device)
+            stitch_mask = dilation(
+                mask_disocclusion.float().to(self.device),
+                kernel=torch.ones(7, 7).to(self.device),
+            )  # keep it slightly dilated to prevent dirty artifacts
         self.image_latest = soft_stitching(
             inpainter_output, self.image_latest_init, stitch_mask, sigma=1, blur_size=3
         )
+        if use_cached_assets and not _base_layer_path.is_file():
+            _base_layer_path.parent.mkdir(parents=True, exist_ok=True)
+            ToPILImage()(self.image_latest[0].clamp(0, 1)).save(_base_layer_path)
         ToPILImage()(self.image_latest[0]).save(
             segmentation_dir / "background_inpainted.png"
         )

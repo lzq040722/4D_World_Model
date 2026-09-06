@@ -14,6 +14,7 @@ import time
 import json
 import warnings
 import importlib
+from types import SimpleNamespace
 from argparse import ArgumentParser
 from pathlib import Path
 from datetime import datetime
@@ -37,6 +38,7 @@ os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "60")
 import cv2
 import numpy as np
 import torch
+import torch.nn as nn
 from PIL import Image
 import imageio
 from omegaconf import OmegaConf
@@ -70,6 +72,7 @@ from util.utils import (
     convert_pt3d_cam_to_3dgs_cam,
     load_example_yaml,
 )
+from util.stable_diffusion_inpaint import StableDiffusionInpaintPipeline
 from util.image_edit_inpaint import ImageEditInpaintPipeline
 from util.segment_utils import create_mask_generator_repvit
 from models.models import KeyframeGen, save_point_cloud_as_ply, debug_vis_func
@@ -93,8 +96,11 @@ from scene.cameras import Camera
 from utils.loss import l1_loss, ssim
 from utils.flow import visualize_flow_as_arrows, camera_traj
 from utils.vace_flow import save_vace_raft_flow
+from realwonder_conditions import prepare_realwonder_conditions
+from realwonder_refinement import run_realwonder_refinement
+from video_scene_refinement import refine_dynamic_scene_from_video
 from syncdiffusion.syncdiffusion_model import SyncDiffusion
-from simulator.diff_simulator_v3 import Simulator
+from simulator.diff_simulator_v3 import Simulator, pt3d_to_gs
 
 from marigold_lcm.marigold_pipeline import (
     MarigoldPipeline,
@@ -105,6 +111,32 @@ import pyvista as pv
 
 warnings.filterwarnings("ignore")
 
+ENABLE_REALWONDER_REFINEMENT_BY_DEFAULT = True
+
+
+def _realwonder_enabled(config):
+    realwonder_config = config.get("realwonder", {}) if config is not None else {}
+    return bool(
+        realwonder_config.get(
+            "enabled",
+            ENABLE_REALWONDER_REFINEMENT_BY_DEFAULT,
+        )
+    )
+
+
+def _video_scene_refinement_enabled(config):
+    refinement_config = (
+        config.get("video_scene_refinement", {}) if config is not None else {}
+    )
+    return bool(refinement_config.get("enabled", True))
+
+
+def _realwonder_output_frame_count(config):
+    realwonder_config = config.get("realwonder", {}) if config is not None else {}
+    latent_frames = int(realwonder_config.get("num_output_frames", 12))
+    return latent_frames * 4 - 3
+
+
 xyz_scale = 1000
 scene_name = None
 view_matrix = [-1, 0, 0, 0, 0, -1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
@@ -113,6 +145,7 @@ background = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32, device="cuda")
 iter_number = None
 kf_gen = None
 annotation_image = None
+input_image = None
 annotation_depth = None
 annotation_valid_mask = None
 gaussians = None
@@ -130,6 +163,325 @@ already_object_pts_num = 0
 def empty_cache():
     torch.cuda.empty_cache()
     gc.collect()
+
+
+def _initial_model_dir(config):
+    """Return the stable, scene-level checkpoint directory.
+
+    ``work_dir`` is the existing WonderPlay equivalent of LivingWorld's
+    ``input_dir``.  Per-run outputs remain under ``kf_gen.run_dir``.
+    """
+    model_dir = Path(config["work_dir"]) / "model"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    return model_dir
+
+
+def _cpu_tree(value):
+    if torch.is_tensor(value):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {key: _cpu_tree(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_cpu_tree(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_cpu_tree(item) for item in value)
+    return value
+
+
+def _cuda_tree(value):
+    if torch.is_tensor(value):
+        return value.to("cuda")
+    if isinstance(value, dict):
+        return {key: _cuda_tree(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_cuda_tree(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_cuda_tree(item) for item in value)
+    return value
+
+
+def _gaussian_state(gaussians):
+    """Capture both trainable and frozen Gaussian partitions."""
+    tensor_names = [
+        "_xyz",
+        "_features_dc",
+        "_scaling",
+        "_rotation",
+        "_opacity",
+        "filter_3D",
+        "_xyz_prev",
+        "_features_dc_prev",
+        "_scaling_prev",
+        "_rotation_prev",
+        "_opacity_prev",
+        "filter_3D_prev",
+        "_scene_flow",
+        "_scene_flow_prev",
+        "_motion_mask",
+        "_motion_mask_prev",
+    ]
+    state = {}
+    for name in tensor_names:
+        value = getattr(gaussians, name, None)
+        if value is not None:
+            state[name] = value.detach().cpu()
+    state["visibility_filter_all"] = gaussians.visibility_filter_all.detach().cpu()
+    state["is_sky_filter"] = gaussians.is_sky_filter.detach().cpu()
+    state["delete_mask_all"] = gaussians.delete_mask_all.detach().cpu()
+    return state
+
+
+def _restore_gaussian_state(state):
+    gaussians = GaussianModel(sh_degree=0)
+    parameter_names = {
+        "_xyz",
+        "_features_dc",
+        "_scaling",
+        "_rotation",
+        "_opacity",
+    }
+    for name, value in state.items():
+        if name in {"visibility_filter_all", "is_sky_filter", "delete_mask_all"}:
+            continue
+        value = value.to("cuda")
+        if name in parameter_names:
+            value = nn.Parameter(value, requires_grad=True)
+        setattr(gaussians, name, value)
+    gaussians.visibility_filter_all = state["visibility_filter_all"].to("cuda")
+    gaussians.is_sky_filter = state["is_sky_filter"].to("cuda")
+    gaussians.delete_mask_all = state["delete_mask_all"].to("cuda")
+    point_count = gaussians.get_xyz_all.shape[0]
+    gaussians.max_radii2D = torch.zeros(point_count, device="cuda")
+    gaussians.xyz_gradient_accum = torch.zeros(point_count, device="cuda")
+    gaussians.denom = torch.zeros(point_count, device="cuda")
+    gaussians.active_sh_degree = gaussians.max_sh_degree
+    return gaussians
+
+
+def _keyframe_state(kf_gen):
+    names = [
+        "image_latest",
+        "image_latest_init",
+        "depth_latest",
+        "depth_latest_init",
+        "disparity_latest",
+        "disparity_latest_init",
+        "sky_mask_latest",
+        "mask_disocclusion",
+        "current_pc",
+        "current_pc_sky",
+        "current_pc_layer",
+        "current_pc_latest",
+        "current_pc_layer_latest",
+        "images",
+        "images_layer",
+        "depths",
+        "disparities",
+        "masks",
+        "post_masks",
+    ]
+    return {
+        name: _cpu_tree(getattr(kf_gen, name))
+        for name in names
+        if getattr(kf_gen, name, None) is not None
+    }
+
+
+def _restore_keyframe_state(kf_gen, state):
+    for name, value in state.items():
+        setattr(kf_gen, name, _cuda_tree(value))
+
+
+def save_initial_scene_cache(
+    config,
+    gaussians,
+    kf_gen,
+    object_infos,
+    object_pts_num_list,
+    gt_masks,
+    ground_value,
+    camera,
+    particle_num_sky,
+    particle_num_base,
+    particle_num_object,
+):
+    """Save only the fixed initial scene, before user view expansion."""
+    model_dir = _initial_model_dir(config)
+    camera_R = torch.as_tensor(camera.R, dtype=torch.float32).cpu()
+    camera_T = torch.as_tensor(camera.T, dtype=torch.float32).cpu()
+    gaussians.save_ply_for_3dgs((model_dir / "finished_3dgs.ply").as_posix())
+    torch.save(
+        gaussians.visibility_filter_all.detach().cpu(),
+        model_dir / "visibility_filter_all.pth",
+    )
+    torch.save(
+        gaussians.is_sky_filter.detach().cpu(),
+        model_dir / "is_sky_filter.pth",
+    )
+    torch.save(
+        gaussians.delete_mask_all.detach().cpu(),
+        model_dir / "delete_mask_all.pth",
+    )
+    torch.save(
+        {
+            "version": 1,
+            "gaussians": _gaussian_state(gaussians),
+            "keyframe": _keyframe_state(kf_gen),
+            "object_infos": _cpu_tree(object_infos),
+            "object_pts_num_list": list(object_pts_num_list),
+            "gt_masks": _cpu_tree(gt_masks),
+            "ground_value": float(ground_value),
+            "particle_num_sky": int(particle_num_sky),
+            "particle_num_base": int(particle_num_base),
+            "particle_num_object": int(particle_num_object),
+            "camera_R": camera_R,
+            "camera_T": camera_T,
+            "camera_FoVx": float(camera.FoVx),
+            "camera_FoVy": float(camera.FoVy),
+        },
+        model_dir / "scene_state.pt",
+    )
+    return model_dir
+
+
+def load_initial_scene_cache(config, kf_gen):
+    """Load the fixed scene checkpoint saved before multiview interaction."""
+    model_dir = _initial_model_dir(config)
+    state_path = model_dir / "scene_state.pt"
+    required = [
+        state_path,
+        model_dir / "finished_3dgs.ply",
+        model_dir / "visibility_filter_all.pth",
+        model_dir / "is_sky_filter.pth",
+        model_dir / "delete_mask_all.pth",
+    ]
+    missing = [path for path in required if not path.is_file()]
+    if missing:
+        missing_text = ", ".join(str(path) for path in missing)
+        raise FileNotFoundError(
+            "load_gen=True requires the fixed-scene checkpoint. "
+            f"Missing: {missing_text}"
+        )
+
+    state = torch.load(state_path, map_location="cpu", weights_only=False)
+    gaussians = _restore_gaussian_state(state["gaussians"])
+    kf_state = state.get("keyframe", {})
+    _restore_keyframe_state(kf_gen, kf_state)
+
+    camera = Camera(
+        R=state["camera_R"].numpy(),
+        T=state["camera_T"].numpy(),
+        FoVx=float(state["camera_FoVx"]),
+        FoVy=float(state["camera_FoVy"]),
+        image=kf_gen.image_latest[0].detach(),
+        data_device="cuda",
+    )
+    scene = SimpleNamespace(
+        train_cameras=[camera],
+        getTrainCameras=lambda: [camera],
+    )
+    return {
+        "model_dir": model_dir,
+        "gaussians": gaussians,
+        "scene": scene,
+        "object_infos": _cuda_tree(state["object_infos"]),
+        "object_pts_num_list": list(state["object_pts_num_list"]),
+        "gt_masks": _cuda_tree(state["gt_masks"]),
+        "ground_value": float(state["ground_value"]),
+        "particle_num_sky": int(state["particle_num_sky"]),
+        "particle_num_base": int(state["particle_num_base"]),
+        "particle_num_object": int(state["particle_num_object"]),
+        "camera": camera,
+    }
+
+
+def _run_loaded_initial_scene(
+    config,
+    kf_gen,
+    content_prompt,
+    style_prompt,
+    background_prompt,
+):
+    """Resume the fixed initial scene and enter the existing interaction loop."""
+    global gaussians, opt, scene_dict, scene_name, annotation_image, input_image
+    global annotation_depth, annotation_valid_mask, sim, current_object_xyz
+
+    loaded = load_initial_scene_cache(config, kf_gen)
+    gaussians = loaded["gaussians"]
+    scene = loaded["scene"]
+    opt = GSParams()
+    kf_gen.set_current_camera(kf_gen.get_camera_at_origin())
+
+    content_list = content_prompt.split(",")
+    scene_dict = {
+        "scene_name": content_list[0],
+        "entities": content_list[1:],
+        "style": style_prompt,
+        "background": background_prompt,
+    }
+    scene_name = content_list[0]
+    # Frontend display uses ``input_image``. Backend motion preparation uses
+    # the cached post-separation/inpaint interaction condition.
+    annotation_image = kf_gen.image_latest.detach().clone()
+    annotation_depth = kf_gen.depth_latest.detach().clone()
+    annotation_valid_mask = (~kf_gen.sky_mask_latest.bool()).detach().clone()
+
+    object_infos = loaded["object_infos"]
+    simulation_steps = config["simulation_steps"]
+    dt = config["dt"]
+    video_gen_fps = 8
+    video_gen_dt = 1 / video_gen_fps
+    num_dt = int(video_gen_dt / dt)
+    simulation_steps = max(1500, num_dt * simulation_steps)
+    simulation_steps = 1000
+
+    save_dir_sim = kf_gen.run_dir / "simulation"
+    save_dir_sim.mkdir(parents=True, exist_ok=True)
+    xyz_obj, xyz_env = gaussians._tmp_get_xyz_all_separate()
+    scaling_obj, scaling_env = gaussians._tmp_get_scaling_all_separate()
+    rotation_obj, rotation_env = gaussians._tmp_get_rotation_all_separate()
+    features_obj, features_env = gaussians._tmp_get_features_dc_all_separate()
+    opacity_obj, opacity_env = gaussians._tmp_get_opacity_all_separate()
+    simulator = Simulator(
+        config=config,
+        obj_gaussians=object_infos,
+        env_gaussians={
+            "xyz": xyz_env.data.requires_grad_(False),
+            "rotation": rotation_env.data.requires_grad_(False),
+            "scaling": scaling_env.data.requires_grad_(False),
+            "features_dc": features_env.data.requires_grad_(False),
+            "opacity": opacity_env.data.requires_grad_(False),
+        },
+        delta_time=dt,
+        save_dir=save_dir_sim,
+    )
+    sim = simulator
+    current_object_xyz = xyz_obj.detach().clone()
+    tdgs_cam = loaded["camera"]
+
+    if config.get("motion_type") == "interaction" and config.get(
+        "multiview", {}
+    ).get("enabled", False):
+        from multiview_controller import run_multiview_controller
+
+        return run_multiview_controller(
+            config=config,
+            simulator=simulator,
+            scene=scene,
+            save_dir=save_dir_sim,
+            simulation_steps=simulation_steps,
+            video_gen_fps=video_gen_fps,
+        )
+
+    return run_interaction_pipeline(
+        simulator,
+        scene,
+        save_dir_sim,
+        config,
+        simulation_steps,
+        video_gen_fps,
+        viewpoint_camera=kf_gen.get_camera_at_origin(),
+    )
 
 
 # ========== LivingWorld Environment Motion Functions ==========
@@ -863,10 +1215,14 @@ def get_interaction_query_points(save_dir, config=None, viewpoint_camera=None):
 
 
 def renderer_displacement_to_genesis(displacement):
-    """Convert a vector from Gaussian/PyTorch3D axes to Genesis axes."""
-    return torch.stack(
-        [-displacement[0], displacement[2], displacement[1]], dim=0
-    )
+    """Convert a PyTorch3D/3DGS displacement to Genesis axes.
+
+    The simulator uses the same point-space mapping for positions:
+    PyTorch3D/3DGS ``(x, y, z)`` -> Genesis ``(-x, z, y)``.  A displacement
+    has no positional offset, so explicitly disable the simulator's optional
+    z offset.
+    """
+    return pt3d_to_gs(displacement, no_z_offset=True)
 
 
 def generate_object_motion_hints(simulation_states, viewpoint_camera):
@@ -1125,6 +1481,8 @@ def interaction_rendering(
     config,
     video_gen_fps,
     viewpoint_camera=None,
+    status_callback=None,
+    refined_preview_callback=None,
 ):
     """Render dynamic object/environment states and generate VACE RAFT flow."""
     global gaussians, opt, background
@@ -1247,22 +1605,59 @@ def interaction_rendering(
         fps=video_gen_fps,
     )
 
-    raft_checkpoint = (
-        _WONDERPLAY_DIR.parent
-        / "VACE"
-        / "models"
-        / "VACE-Annotators"
-        / "flow"
-        / "raft-things.pth"
-    )
-    save_vace_raft_flow(
-        video_path=render_video_path,
-        traj_dir=traj_dir,
-        fps=video_gen_fps,
-        checkpoint_path=raft_checkpoint,
-        device=config["device"],
-    )
+    playback_states = simulation_states
+    if _realwonder_enabled(config):
+        raft_checkpoint = (
+            _WONDERPLAY_DIR.parent
+            / "VACE"
+            / "models"
+            / "VACE-Annotators"
+            / "flow"
+            / "raft-things.pth"
+        )
+        save_vace_raft_flow(
+            video_path=render_video_path,
+            traj_dir=traj_dir,
+            fps=video_gen_fps,
+            checkpoint_path=raft_checkpoint,
+            device=config["device"],
+        )
+        realwonder_conditions = prepare_realwonder_conditions(
+            save_dir, config=config, traj_id=0, overwrite=True
+        )
+        if status_callback is not None:
+            status_callback("Video Refinement.")
+        refinement_result = run_realwonder_refinement(
+            realwonder_conditions,
+            config=config,
+        )
+        empty_cache()
+        if _video_scene_refinement_enabled(config):
+            if status_callback is not None:
+                status_callback("Optimizing 3D scene from generated video.")
+            scene_refinement_result = refine_dynamic_scene_from_video(
+                target_frames_dir=refinement_result["refined_frames_dir"],
+                simulation_states=simulation_states,
+                motion_model=motion_model,
+                gaussians=gaussians,
+                viewpoint_camera=viewpoint_camera,
+                opt=opt,
+                background=background,
+                config=config,
+                output_dir=traj_dir / "video_supervised_3d",
+                fps=refinement_result["fps"],
+                status_callback=status_callback,
+            )
+            empty_cache()
+            playback_states = scene_refinement_result["playback_states"]
+            if status_callback is not None:
+                status_callback("Optimized 3D scene ready for playback.")
+        elif refined_preview_callback is not None:
+            refined_preview_callback(refinement_result)
+    else:
+        print("[realwonder] Video refinement disabled; using coarse 3DGS preview.", flush=True)
     print(f"[interaction] Unified output saved to {traj_dir}")
+    return playback_states
 
 
 def run_interaction_pipeline(
@@ -1274,11 +1669,23 @@ def run_interaction_pipeline(
     video_gen_fps,
     viewpoint_camera=None,
     motion_model=None,
+    status_callback=None,
+    refined_preview_callback=None,
 ):
     global current_object_xyz
     direction, velocity_scale = validate_interaction_config(config)
     interaction = config.get("interaction", {})
     num_frames = int(config.get("interaction", {}).get("num_frames", 50))
+    if _realwonder_enabled(config) and _video_scene_refinement_enabled(config):
+        required_frames = _realwonder_output_frame_count(config)
+        if num_frames != required_frames:
+            print(
+                f"[interaction] Using {required_frames} frames so the simulated 3D "
+                f"sequence exactly matches the RealWonder output; configured "
+                f"interaction.num_frames={num_frames}.",
+                flush=True,
+            )
+        num_frames = required_frames
     if num_frames < 2:
         raise ValueError("interaction.num_frames must be at least 2")
 
@@ -1359,7 +1766,7 @@ def run_interaction_pipeline(
             f"{int(env_motion_mask.sum().item())}/{env_motion_mask.numel()} points"
         )
 
-    interaction_rendering(
+    playback_states = interaction_rendering(
         simulation_states,
         motion_model,
         scene,
@@ -1367,8 +1774,14 @@ def run_interaction_pipeline(
         config,
         video_gen_fps,
         viewpoint_camera=viewpoint_camera,
+        status_callback=status_callback,
+        refined_preview_callback=refined_preview_callback,
     )
-    return motion_model, simulation_states
+    if playback_states:
+        current_object_xyz = (
+            playback_states[-1]["obj_0000"]["xyz"].detach().clone()
+        )
+    return motion_model, playback_states
 
 
 def environment_motion_rendering(gaussians, scene, save_dir, config, video_gen_fps, sky_gaussians=None):
@@ -1576,6 +1989,8 @@ def environment_motion_rendering(gaussians, scene, save_dir, config, video_gen_f
             fps=video_gen_fps,
         )
 
+    prepare_realwonder_conditions(save_dir, config=config, traj_id=0, overwrite=True)
+
     print(f"[environment_motion_rendering] Completed! Saved to {output_dir}")
     print(f"  - {num_frames} frames")
     print(f"  - Video: environment_motion.mp4")
@@ -1666,44 +2081,47 @@ def load_oneformer():
     return processor, model
 
 
-def run(config, dt_string=None):
-    global view_matrix, scene_name, kf_gen, gaussians, opt, background, scene_dict, style_prompt, pt_gen
-    global sim, movement, already_object_pts_num, current_object_xyz
-    global annotation_image, annotation_depth, annotation_valid_mask
-    already_object_pts_num = 0
-    current_object_xyz = None
-    annotation_image = None
-    annotation_depth = None
-    annotation_valid_mask = None
-    ###### ------------------ Load modules ------------------ ######
-
-    seeding(config["seed"])
-    example = config["example_name"]
-    motion_type = config.get("motion_type", "object")
-    if motion_type == "interaction":
-        validate_interaction_config(config)
-
+def _load_generation_models(config, motion_type):
+    """Load models needed only when generating a new view or scene."""
     segment_processor, segment_model = load_oneformer()
     segment_model = segment_model.to("cuda")
-
     mask_generator = create_mask_generator_repvit()
 
-    image_edit_checkpoint = config.get(
-        "image_edit_checkpoint", "/root/autodl-tmp/huggingface/hub"
-    )
-    print(f"[INFO] Loading Image-Edit inpainter from {image_edit_checkpoint} ...")
-    inpainter_pipeline = ImageEditInpaintPipeline.from_pretrained(
-        image_edit_checkpoint,
-        torch_dtype=torch.bfloat16,
-        local_files_only=True,
-    ).to(config["device"])
-    inpainter_pipeline.set_progress_bar_config(disable=None)
-    print("[INFO] Image-Edit inpainter loaded.")
+    inpainting_backend = str(
+        config.get("inpainting_backend", "stable_diffusion")
+    ).lower()
+    if inpainting_backend in {"image_edit", "qwen", "qwen_image_edit"}:
+        image_edit_checkpoint = config.get(
+            "image_edit_checkpoint", "/root/autodl-tmp/huggingface/hub"
+        )
+        print(
+            "[INFO] Loading ModelScope Qwen ImageEdit Plus inpainter from "
+            f"{image_edit_checkpoint} ..."
+        )
+        inpainter_pipeline = ImageEditInpaintPipeline.from_pretrained(
+            image_edit_checkpoint,
+            torch_dtype=torch.bfloat16,
+            local_files_only=True,
+        ).to(config["device"])
+        inpainter_pipeline.set_progress_bar_config(disable=None)
+        print("[INFO] Image-Edit inpainter loaded.")
+    else:
+        sd_checkpoint = config["stable_diffusion_checkpoint"]
+        print(f"[INFO] Loading Stable Diffusion 2 inpainter from {sd_checkpoint} ...")
+        inpainter_pipeline = StableDiffusionInpaintPipeline.from_pretrained(
+            sd_checkpoint,
+            safety_checker=None,
+            torch_dtype=torch.bfloat16,
+            variant="fp16",
+            use_safetensors=True,
+        ).to(config["device"])
+        inpainter_pipeline.scheduler = DDIMScheduler.from_config(
+            inpainter_pipeline.scheduler.config
+        )
+        inpainter_pipeline.unet.set_attn_processor(AttnProcessor2_0())
+        inpainter_pipeline.vae.set_attn_processor(AttnProcessor2_0())
+        print("[INFO] Stable Diffusion 2 inpainter loaded.")
 
-    rotation_path = config["rotation_path"][: config["num_scenes"]]
-    assert len(rotation_path) == config["num_scenes"]
-
-    # Depth estimation: Marigold only
     depth_model = MarigoldPipeline.from_pretrained(
         "prs-eth/marigold-v1-0",
         torch_dtype=torch.bfloat16,
@@ -1726,7 +2144,6 @@ def run(config, dt_string=None):
         use_safetensors=True,
     ).to(config["device"])
 
-    # Skip mvdiffusion loading for environment motion mode
     if motion_type == "environment":
         print("[INFO] Skipping mvdiffusion loading (not needed for environment motion)")
         mvdiffusion = None
@@ -1740,7 +2157,6 @@ def run(config, dt_string=None):
         mvdiffusion.scheduler = EulerAncestralDiscreteScheduler.from_config(
             mvdiffusion.scheduler.config, timestep_spacing="trailing"
         )
-        # load InstantMesh finetuned white-background UNet
         print("Loading custom white-background unet ...")
         unet_ckpt_path = hf_hub_download(
             repo_id="TencentARC/InstantMesh",
@@ -1750,6 +2166,60 @@ def run(config, dt_string=None):
         )
         state_dict = torch.load(unet_ckpt_path, map_location="cpu")
         mvdiffusion.unet.load_state_dict(state_dict, strict=True)
+
+    return {
+        "segment_processor": segment_processor,
+        "segment_model": segment_model,
+        "mask_generator": mask_generator,
+        "inpainter_pipeline": inpainter_pipeline,
+        "depth_model": depth_model,
+        "normal_estimator": normal_estimator,
+        "mvdiffusion": mvdiffusion,
+    }
+
+
+def run(config, dt_string=None):
+    global view_matrix, scene_name, kf_gen, gaussians, opt, background, scene_dict, style_prompt, pt_gen
+    global sim, movement, already_object_pts_num, current_object_xyz
+    global annotation_image, input_image, annotation_depth, annotation_valid_mask
+    already_object_pts_num = 0
+    current_object_xyz = None
+    annotation_image = None
+    input_image = None
+    annotation_depth = None
+    annotation_valid_mask = None
+    ###### ------------------ Load modules ------------------ ######
+
+    seeding(config["seed"])
+    example = config["example_name"]
+    motion_type = config.get("motion_type", "object")
+    if motion_type == "interaction":
+        validate_interaction_config(config)
+
+    if config.get("load_gen", False):
+        generation_models = {
+            "segment_processor": None,
+            "segment_model": None,
+            "mask_generator": None,
+            "inpainter_pipeline": None,
+            "depth_model": None,
+            "normal_estimator": None,
+            "mvdiffusion": None,
+        }
+        print("[cache] Deferring generation-model loading until a new view is requested.")
+    else:
+        generation_models = _load_generation_models(config, motion_type)
+
+    rotation_path = config["rotation_path"][: config["num_scenes"]]
+    assert len(rotation_path) == config["num_scenes"]
+
+    segment_processor = generation_models["segment_processor"]
+    segment_model = generation_models["segment_model"]
+    mask_generator = generation_models["mask_generator"]
+    inpainter_pipeline = generation_models["inpainter_pipeline"]
+    depth_model = generation_models["depth_model"]
+    normal_estimator = generation_models["normal_estimator"]
+    mvdiffusion = generation_models["mvdiffusion"]
 
     # sam_model = sam_model_registry['vit_l'](checkpoint="/viscam/projects/wonder_dy/zzli/ckpts/sam_vit_l_0b3195.pth")
     # _ = sam_model.to(device=config["device"])
@@ -1782,8 +2252,34 @@ def run(config, dt_string=None):
         inpainting_resolution=config["inpainting_resolution_gen"],
         mvdiffusion=mvdiffusion,
         sam_model=None,
+        load_instantmesh=not config.get("load_gen", False),
         dt_string=dt_string,
     ).to(config["device"])
+
+    def ensure_generation_models():
+        nonlocal generation_models
+        required_models_ready = (
+            kf_gen.segment_model is not None
+            and kf_gen.mask_generator is not None
+            and kf_gen.inpainting_pipeline is not None
+            and kf_gen.depth_model is not None
+            and kf_gen.normal_estimator is not None
+            and kf_gen.mvdiffusion is not None
+        )
+        if required_models_ready:
+            return
+        generation_models = _load_generation_models(config, motion_type)
+        kf_gen.segment_processor = generation_models["segment_processor"]
+        kf_gen.segment_model = generation_models["segment_model"]
+        kf_gen.mask_generator = generation_models["mask_generator"]
+        kf_gen.inpainting_pipeline = generation_models["inpainter_pipeline"]
+        kf_gen.depth_model = generation_models["depth_model"]
+        kf_gen.normal_estimator = generation_models["normal_estimator"]
+        kf_gen.mvdiffusion = generation_models["mvdiffusion"]
+        kf_gen._load_instantmesh()
+        print("[cache] Deferred generation models are ready.")
+
+    kf_gen.ensure_generation_models = ensure_generation_models
 
     prompt_data = None
     prompt_yaml = _repo_root / "examples" / "examples.yaml"
@@ -1840,10 +2336,18 @@ def run(config, dt_string=None):
     kf_gen.image_latest = ToTensor()(start_keyframe).unsqueeze(0).to(config["device"])
     # Keep the raw input frame as the immutable image used for the first
     # motion annotation.  Recomposition below may update image_latest.
-    annotation_image = kf_gen.image_latest.detach().clone()
+    input_image = kf_gen.image_latest.detach().clone()
+    annotation_image = input_image.detach().clone()
 
-    syncdiffusion_model = SyncDiffusion(config['device'], sd_version='2.0-inpaint')
-    # syncdiffusion_model = None
+    if config.get("load_gen", False):
+        print("[cache] Loading fixed initial scene; skipping scene reconstruction.")
+        return _run_loaded_initial_scene(
+            config=config,
+            kf_gen=kf_gen,
+            content_prompt=content_prompt,
+            style_prompt=style_prompt,
+            background_prompt=background_prompt,
+        )
 
     # always check if sky image and sky pointcloud are existed or not, if not then generate
     example_name = config["example_name"]
@@ -1865,27 +2369,16 @@ def run(config, dt_string=None):
         for_sky_image = kf_gen.image_latest
 
     _sky_dir = Path(config["sky_image_dir"])
-    if not (_sky_dir / "sky_0.png").exists():
-        config["gen_sky_image"] = True
-    else:
-        config["gen_sky_image"] = False
-
-    if not (_sky_dir / "finished_3dgs_sky_tanh.ply").exists():
-        config["gen_sky"] = True
-    else:
-        config["gen_sky"] = False
-
-    kf_gen.generate_sky_pointcloud( # the image is actually not used here, just the sky_mask
-        syncdiffusion_model,
-        image=for_sky_image,
-        mask=sky_mask,
-        gen_sky=config["gen_sky_image"],
-        style=style_prompt,
+    config["gen_sky_image"] = not (
+        (_sky_dir / "sky_0.png").exists() and (_sky_dir / "sky_1.png").exists()
     )
-
-    kf_gen.recompose_image_latest_and_set_current_pc()
-    annotation_depth = kf_gen.depth_latest.detach().clone()
-    annotation_valid_mask = (~kf_gen.sky_mask_latest.bool()).detach().clone()
+    config["gen_sky"] = not (_sky_dir / "finished_3dgs_sky_tanh.ply").exists()
+    syncdiffusion_model = None
+    if config["gen_sky_image"]:
+        print("[INFO] Sky panorama cache is incomplete; loading SyncDiffusion.")
+        syncdiffusion_model = SyncDiffusion(config["device"], sd_version="2.0-inpaint")
+    else:
+        print("[cache] Reusing sky panorama images; SyncDiffusion is not loaded.")
 
     content_list = content_prompt.split(",")
     scene_name = content_list[0]
@@ -1896,13 +2389,24 @@ def run(config, dt_string=None):
         "style": style_prompt,
         "background": background_prompt,
     }
-    inpainting_prompt = content_prompt
+    kf_gen.generate_sky_pointcloud( # the image is actually not used here, just the sky_mask
+        syncdiffusion_model,
+        image=for_sky_image,
+        mask=sky_mask,
+        gen_sky=config["gen_sky_image"],
+        style=style_prompt,
+    )
+
+    kf_gen.recompose_image_latest_and_set_current_pc(
+        use_cached_assets=True, scene_name=scene_name
+    )
+    annotation_image = kf_gen.image_latest.detach().clone()
+    annotation_depth = kf_gen.depth_latest.detach().clone()
+    annotation_valid_mask = (~kf_gen.sky_mask_latest.bool()).detach().clone()
 
     kf_gen.increment_kf_idx()
     ###### ------------------ Main loop ------------------ ######
 
-    sky_example = config["example_name"]
-    config["gen_sky"] = True
     if config["gen_sky"]:
         traindatas = kf_gen.convert_to_3dgs_traindata(
             xyz_scale=xyz_scale, remove_threshold=None, use_no_loss_mask=False
@@ -1941,6 +2445,9 @@ def run(config, dt_string=None):
         gaussians.get_xyz_all.shape[0], dtype=torch.bool, device="cuda"
     )
     gaussians.is_sky_filter = torch.ones(
+        gaussians.get_xyz_all.shape[0], dtype=torch.bool, device="cuda"
+    )
+    gaussians.delete_mask_all = torch.zeros(
         gaussians.get_xyz_all.shape[0], dtype=torch.bool, device="cuda"
     )
     opt = GSParams()
@@ -2181,6 +2688,24 @@ def run(config, dt_string=None):
             },
             delta_time=dt,
             save_dir=save_dir_sim,
+        )
+
+        save_initial_scene_cache(
+            config=config,
+            gaussians=gaussians,
+            kf_gen=kf_gen,
+            object_infos=object_infos,
+            object_pts_num_list=object_pts_num_list,
+            gt_masks=gt_masks,
+            ground_value=traindata_layer["ground_value"],
+            camera=tdgs_cam,
+            particle_num_sky=particle_num_sky,
+            particle_num_base=particle_num_base,
+            particle_num_object=particle_num_object,
+        )
+        print(
+            f"[cache] Saved fixed initial scene checkpoint to "
+            f"{_initial_model_dir(config)}"
         )
 
         print("SAVING 3D RESULTS")

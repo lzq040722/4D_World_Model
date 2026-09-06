@@ -68,7 +68,8 @@ interaction:
   velocity_scale: <alpha>
 
   # Number of unified RGB/depth/mask/flow frames. Must be at least 2.
-  num_frames: 50
+  # RealWonder default produces 12 latent frames -> 12 * 4 - 3 = 45 RGB frames.
+  num_frames: 45
 
   # Optional environment integration amplitude. If omitted, the
   # environment_motion.scale_factor value is used.

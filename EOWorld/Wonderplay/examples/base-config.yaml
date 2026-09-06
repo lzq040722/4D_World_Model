@@ -22,6 +22,7 @@ num_finetune_decoder_steps_interp: 30
 preservation_weight: 10
 
 #inpainting parameters
+inpainting_backend: "stable_diffusion"  # options: stable_diffusion, image_edit
 stable_diffusion_checkpoint: "sd2-community/stable-diffusion-2-inpainting" #"dreambooth_models/mountains-sks-1500"
 image_edit_checkpoint: "/root/autodl-tmp/huggingface/hub"
 inpainting_resolution_interp: 512
@@ -68,3 +69,14 @@ multiview:
 load_gen: False
 
 imgto3D: False
+
+# Close the WonderPlay loop after RealWonder generation: use the generated
+# frames as 2D supervision, update the per-frame dynamic 3D scene through the
+# differentiable Gaussian renderer, then play the new 3D renders in the UI.
+video_scene_refinement:
+  enabled: True
+  iterations_per_frame: 30
+  position_lr: 0.001
+  object_feature_lr: 0.01
+  background_feature_lr: 0.01
+  log_interval: 10

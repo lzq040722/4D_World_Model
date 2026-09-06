@@ -108,7 +108,7 @@ interaction:
   direction: "env2obj"  # "env2obj" or "obj2env"
   # v_obj = velocity_scale * environment_displacement
   velocity_scale: 0.5
-  num_frames: 50
+  num_frames: 45
   # Environment Gaussian 的渲染运动幅度
   environment_scale_factor: 1.0
 

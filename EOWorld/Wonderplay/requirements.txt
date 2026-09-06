@@ -17,6 +17,7 @@ flask_socketio
 flask_cors
 kornia
 diffusers==0.36.0
+modelscope
 rp
 einops
 decord

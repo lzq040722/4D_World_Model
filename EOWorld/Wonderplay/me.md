@@ -86,9 +86,9 @@ PY
 
 转换成realwonder 所需要格式：
 CUDA_VISIBLE_DEVICES=0 python prepare_realwonder_input.py \
-  --simulation_dir 3d_result/wonderplay/venice/obj2env1/simulation \
+  --simulation_dir 3d_result/wonderplay/venice/Gen-25-08_19-20-57/simulation/view_000 \
   --traj_id 0 \
-  --output_dir /root/autodl-tmp/RealWonder/input_data/venice_obj2env1/final_sim \
+  --output_dir /root/autodl-tmp/RealWonder/input_data/venice_obj2env512*512/final_sim \
   --num_output_frames 12 \
   --flow_format normalized \
   --overwrite
@@ -96,8 +96,8 @@ CUDA_VISIBLE_DEVICES=0 python prepare_realwonder_input.py \
 跑realwonder 视频生成模型：
 CUDA_VISIBLE_DEVICES=0 python infer_sim.py \
   --checkpoint_path 'ckpts/Realwonder-Distilled-AR-I2V-Flow/sink_size=1-attn_size=21-frame_per_block=3-denoising_steps=4/step=000800.pt' \
-  --sim_data_path input_data/venice_obj2env1/final_sim \
-  --output_path input_data/vencie_obj2env1/final_sim/realwonder_output.mp4 \
+  --sim_data_path input_data/venice_obj2env512*512/final_sim \
+  --output_path input_data/vencie_obj2env512*512/final_sim/realwonder_output.mp4 \
   --eval_degradation 0.5 \
   --local_attn_size 21 \
   --seed 42
@@ -113,6 +113,20 @@ final_hint_end_y-3d [array([473.], dtype=float32), array([449.], dtype=float32),
 git add.
 git commit -m ' ' 
 git push
+
+git 第一次设置仓库地址：
+git remote add origin 仓库地址
+
+git 修改仓库地址：
+git remote set-url origin 仓库地址
+
+git branch : 查看当前分支
+
+git branch -r ： 查看远程分支
+
+git branch -vv : 查看本地分支绑定了哪个远程分支
+
+git push origin 本地分支(main) ：远程分支 
 
 11. stresss test:
 /root/autodl-tmp/LivingWorld/scripts/gpu_stress_every_30min.sh
@@ -145,3 +159,10 @@ b_pos[..., 1] = motion_pts[None, :, 1]
 13. 8/24 交流内容：
 a. 完整的多视角交互逻辑
 b. 可以选用更少的3DGS进行模拟，最后交给视频优化就好
+
+9/2 本周待完成任务：
+1. 实现可交互、增量式场景扩展
+2. 使用双卡运行，将部分模型（如Image-edit）并行加载到另一张卡，需要使用时直接给input，以减少加载模型所浪费的时间
+
+
+[prepare_realwonder_input.py](/root/autodl-tmp/EOWorld/Wonderplay/prepare_realwonder_input.py)  我现在是使用这个脚本将目前产生的文件转换成realwonder所需要的格式，然后到对应的项目 /root/autodl-tmp/RealWonder 里边去在运行视频生成的部分，但是这样会显得很麻烦， 我需要你帮我把 RealWonderplay中有关视频生成的代码迁移过来。

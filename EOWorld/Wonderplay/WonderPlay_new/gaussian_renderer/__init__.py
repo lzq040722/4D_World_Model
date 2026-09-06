@@ -847,6 +847,8 @@ def render(viewpoint_camera, pc: GaussianModel, opt, bg_color: torch.Tensor, sca
     
     Background tensor (bg_color) must be on GPU!
     """
+    if hasattr(pc, "_ensure_metadata_lengths"):
+        pc._ensure_metadata_lengths()
  
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
     # screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0

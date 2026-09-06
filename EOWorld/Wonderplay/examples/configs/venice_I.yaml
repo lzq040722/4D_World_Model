@@ -25,9 +25,11 @@ enable_regenerate: False
 
 debug: True
 inpainting_resolution_gen: 512
+inpainting_backend: "image_edit"
 image_edit_checkpoint: "/root/autodl-tmp/huggingface/hub"
 inpainting_resolution_interp: 512
-negative_inpainting_prompt: "collage, text, writings, signs, text, white border, photograph border, artifacts, blur, blurry, foggy, fog, bad quality, distortions, distorted image, watermark, signature, fisheye look"
+prompt: "Outpaint the missing area as a seamless continuation of the existing scene. Match the perspective, composition, lighting, color tone, texture, and visual style of the original image. Make the water surface especially continuous across the mask boundary, with matching reflections, ripples, brightness, and shadow direction. Preserve the visible content and blend the completed region naturally."
+negative_prompt: "visible seam, hard edge, mismatched lighting, inconsistent reflections, broken water ripples, color shift, blurry artifacts, distorted buildings, text, watermark"
 
 rotation_path: [2, 2, 2, 2, 2, 2, 2, 2, -2, -2, -2, -2, -2, -2, -2, -2]
 camera_speed_multiplier_rotation: 0.3
@@ -91,7 +93,7 @@ interaction:
   direction: "env2obj"  # "env2obj" or "obj2env"
   # v_obj = velocity_scale * environment_displacement
   velocity_scale: 0.5
-  num_frames: 50
+  num_frames: 45
   # Environment Gaussian 的渲染运动幅度
   environment_scale_factor: 1.0
 
@@ -112,6 +114,6 @@ environment_motion:
 multiview:
   enabled: True
   expansion_iterations: 100
-  inpainting_steps: 50
+  inpainting_steps: 40
   stop: False
-load_gen: False
+load_gen: True

@@ -22,6 +22,11 @@ DEFAULT_CHECKPOINT = Path(
     "step=000800.pt"
 )
 
+TARGET_HEIGHT = 512
+TARGET_WIDTH = 512
+LATENT_DOWNSAMPLE = 8
+NOISE_CHANNELS = 32
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -49,8 +54,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--crop_start",
         type=int,
-        default=176,
-        help="Top of the 480-pixel crop after resizing 512x512 to 832x832.",
+        default=0,
+        help="Deprecated; kept for CLI compatibility. 512x512 output does not crop.",
     )
     parser.add_argument(
         "--num_output_frames",
@@ -99,8 +104,8 @@ def parse_args() -> argparse.Namespace:
 def validate_args(args: argparse.Namespace) -> None:
     if args.num_output_frames <= 0 or args.num_output_frames % 3 != 0:
         raise ValueError("--num_output_frames must be positive and divisible by 3")
-    if not 0 <= args.crop_start <= 352:
-        raise ValueError("--crop_start must be in [0, 352]")
+    if args.crop_start != 0:
+        raise ValueError("--crop_start must be 0 for 512x512 output")
     if not 0 <= args.eval_degradation <= 1:
         raise ValueError("--eval_degradation must be in [0, 1]")
     if not args.realwonder_root.joinpath("infer_sim.py").exists():
@@ -111,10 +116,12 @@ def validate_args(args: argparse.Namespace) -> None:
 
 def resize_and_crop(image_path: Path, crop_start: int) -> Image.Image:
     image = Image.open(image_path).convert("RGB")
-    if image.size != (512, 512):
-        print(f"Warning: expected 512x512, got {image.size} for {image_path}")
-    image = image.resize((832, 832), Image.Resampling.BILINEAR)
-    return image.crop((0, crop_start, 832, crop_start + 480))
+    if image.size != (TARGET_WIDTH, TARGET_HEIGHT):
+        print(
+            f"Warning: expected {TARGET_WIDTH}x{TARGET_HEIGHT}, "
+            f"got {image.size} for {image_path}"
+        )
+    return image.resize((TARGET_WIDTH, TARGET_HEIGHT), Image.Resampling.BILINEAR)
 
 
 def prepare_rgb_inputs(args: argparse.Namespace, traj_dir: Path) -> int:
@@ -199,7 +206,11 @@ def generate_structured_noise(
     noise_path = args.output_dir / "noises.npy"
     if noise_path.exists() and not args.overwrite:
         noise = np.load(noise_path, mmap_mode="r")
-        expected_spatial_channels = (60, 104, 32)
+        expected_spatial_channels = (
+            TARGET_HEIGHT // LATENT_DOWNSAMPLE,
+            TARGET_WIDTH // LATENT_DOWNSAMPLE,
+            NOISE_CHANNELS,
+        )
         if tuple(noise.shape[1:]) != expected_spatial_channels:
             raise ValueError(
                 f"Existing {noise_path} has shape {noise.shape}; expected "
@@ -225,12 +236,17 @@ def generate_structured_noise(
         flows,
         str(args.output_dir),
         input_flow=True,
-        crop_start=args.crop_start,
+        output_height=TARGET_HEIGHT,
+        output_width=TARGET_WIDTH,
         debug=False,
     )
 
     noise = np.load(noise_path, mmap_mode="r")
-    expected_spatial_channels = (60, 104, 32)
+    expected_spatial_channels = (
+        TARGET_HEIGHT // LATENT_DOWNSAMPLE,
+        TARGET_WIDTH // LATENT_DOWNSAMPLE,
+        NOISE_CHANNELS,
+    )
     if tuple(noise.shape[1:]) != expected_spatial_channels:
         raise RuntimeError(
             f"Generated noise has shape {noise.shape}; expected "

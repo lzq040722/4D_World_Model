@@ -15,9 +15,10 @@ pipeline.to("cuda")
 pipeline.set_progress_bar_config(disable=None)
 
 image1 = Image.open(
-    "3d_result/wonderplay/venice/Gen-13-08_22-07-45/segmentation/foreground_removed_hole.png"
+    "3d_result/wonderplay/venice/Gen-02-09_21-09-32/multiview_000/generation_condition.png"
 )
-prompt = "Remove the boat from the river."
+prompt = "Style: DSLR 35mm landscape. Entities:  boats,  historical buildings,  waterway ."
+negative_prompt = "collage, text, writings, signs, text, white border, photograph border, artifacts, blur, blurry, foggy, fog, bad quality, distortions, distorted image, watermark, signature, fisheye look"
 
 iteration = 0
 try:
@@ -140,19 +141,19 @@ except KeyboardInterrupt:
 
 # # 原图
 # image = Image.open(
-#     "examples/imgs/venice/image.png"
+#     "3d_result/wonderplay/venice/Gen-02-09_21-09-32/multiview_000/generation_condition.png"
 # ).convert("RGB")
 
 # # mask：
-# # 白色区域 = 船的位置，要重绘
+# # 白色区域 = 要重绘 / outpaint 的区域
 # # 黑色区域 = 其他部分，不修改
 # mask = Image.open(
-#     "3d_result/wonderplay/venice/Gen-13-08_22-07-45/segmentation/sam_mask_03.png"
+#     "3d_result/wonderplay/venice/Gen-02-09_21-09-32/multiview_000/generation_hole_mask.png"
 # ).convert("L")
 
 
 # prompt = (
-#     "Remove the boat from the river "
+#     "Style: DSLR 35mm landscape. Entities:  boats,  historical buildings,  waterway . Background:"
 # )
 
 
@@ -160,11 +161,10 @@ except KeyboardInterrupt:
 #     "image": image,
 #     "mask_image": mask,
 #     "prompt": prompt,
-
 #     "generator": torch.Generator(device="cuda").manual_seed(0),
 
 #     "true_cfg_scale": 7.0,
-#     "negative_prompt": " ",
+#     "negative_prompt": "collage, text, writings, signs, text, white border, photograph border, artifacts, blur, blurry, foggy, fog, bad quality, distortions, distorted image, watermark, signature, fisheye look",
 
 #     "num_inference_steps": 40,
 
@@ -181,9 +181,9 @@ except KeyboardInterrupt:
 
 # output_image = output.images[0]
 
-# output_image.save("output_image_edit_mask.png")
+# output_image.save("outpaint.png")
 
 # print(
 #     "image saved at",
-#     os.path.abspath("output_image_edit_mask.png")
+#     os.path.abspath("outpaint.png")
 # )

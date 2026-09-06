@@ -240,11 +240,23 @@ class Simulator(nn.Module):
         for idx in range(self.len_obj):
             obj_gaussian = obj_gaussians[idx]
             obj_mesh_path = obj_gaussian["mesh_path"]
-            obj_mesh_new_path = obj_mesh_path[:-4] + "_gscoord.obj"
-            tmp_mesh = trimesh.load(obj_mesh_path, process=False)
-            tmp_mesh.vertices = pt3d_to_gs(np.array(tmp_mesh.vertices))
-            tmp_mesh.export(obj_mesh_new_path)
-            os.remove(obj_mesh_path)
+            obj_mesh_root, _ = os.path.splitext(obj_mesh_path)
+            obj_mesh_new_path = obj_mesh_root + "_gscoord.obj"
+
+            if obj_mesh_path.endswith("_gscoord.obj"):
+                obj_mesh_new_path = obj_mesh_path
+                tmp_mesh = trimesh.load(obj_mesh_new_path, process=False)
+            elif os.path.isfile(obj_mesh_path):
+                tmp_mesh = trimesh.load(obj_mesh_path, process=False)
+                tmp_mesh.vertices = pt3d_to_gs(np.array(tmp_mesh.vertices))
+                tmp_mesh.export(obj_mesh_new_path)
+            elif os.path.isfile(obj_mesh_new_path):
+                tmp_mesh = trimesh.load(obj_mesh_new_path, process=False)
+            else:
+                raise FileNotFoundError(
+                    "Object mesh is missing. Expected either "
+                    f"{obj_mesh_path} or {obj_mesh_new_path}."
+                )
 
             translation = obj_gaussian["translation"]
             translation = np.array(translation).reshape(1, 3)
@@ -1039,10 +1051,6 @@ class Simulator(nn.Module):
             )
         qvel[:3] = velocity
         self.objs[obj_id].set_dofs_velocity(qvel)
-        print(
-            "[interaction] Set Genesis object linear velocity:",
-            velocity.detach().cpu().numpy(),
-        )
         
     def env_process(self, env_xyz, obj_valid_min, obj_valid_max, obj_min, obj_max):
         # by option keep only the environment within the object range
